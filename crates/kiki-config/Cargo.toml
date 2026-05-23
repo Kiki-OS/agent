@@ -25,6 +25,10 @@ base64         = "0.22"
 # BIP39 for recovery codes
 bip39          = { version = "2", default-features = false, features = ["std", "rand"] }
 
+# macOS Keychain backend for the OS keystore (master-key caching).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
+
 [dev-dependencies]
 hex-literal    = "0.4"
 tokio          = { workspace = true, features = ["macros", "rt-multi-thread"] }

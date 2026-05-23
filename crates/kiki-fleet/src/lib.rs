@@ -26,3 +26,4 @@ pub mod migration;
 pub use client::FleetClient;
 pub use heartbeat::Heartbeat;
 pub use migration::{MigrationReceiver, MigrationSender, RestoredSession};
+pub use sync::{connect_device, DeviceInbound, SessionPublisher, StatePatch};

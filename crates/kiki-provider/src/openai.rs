@@ -85,6 +85,11 @@ impl OpenAiProvider {
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &str { "openai" }
 
+    /// Remote unless the endpoint is loopback (e.g. a local Ollama / llama-server).
+    fn is_remote(&self) -> bool {
+        !(self.cfg.base_url.contains("://localhost") || self.cfg.base_url.contains("://127.0.0.1"))
+    }
+
     fn supports_model(&self, model: &str) -> bool {
         match &self.cfg.model_prefixes {
             // Empty list ⇒ accept anything (used for local/Ollama endpoints).

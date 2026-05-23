@@ -223,6 +223,8 @@ async fn main() -> anyhow::Result<()> {
     // of scope here — they require API keys synced via kiki-config Secrets).
     let provider: Arc<dyn kiki_core::provider::LlmProvider> = {
         use kiki_provider::local::{LlamaCppProvider, LlamaConfig};
+        use kiki_provider::{ProviderRouter, anthropic::AnthropicProvider, openai::OpenAiProvider};
+
         let llama_cfg = LlamaConfig {
             binary:    std::path::PathBuf::from(&cfg.inference.llama_server_bin),
             idle_ttl:  std::time::Duration::from_secs(cfg.inference.idle_ttl_secs),
@@ -234,8 +236,32 @@ async fn main() -> anyhow::Result<()> {
             root:         std::path::PathBuf::from(&cfg.inference.local_model_dir),
             context_size: cfg.inference.context_size,
         });
-        Arc::new(LlamaCppProvider::new(llama_cfg, resolver))
-            as Arc<dyn kiki_core::provider::LlmProvider>
+        let local = Arc::new(LlamaCppProvider::new(llama_cfg, resolver));
+
+        // Router: cloud providers (specific model prefixes) take priority, the
+        // local llama.cpp runtime is the catch-all fallback. The router enforces
+        // the privacy policy — when allow_remote is false, remote providers are
+        // never selected regardless of model id. Cloud API keys are read from the
+        // environment here as a bootstrap; production syncs them via kiki-config
+        // Secrets.
+        let mut router = ProviderRouter::new(cfg.router_policy.allow_remote);
+        if cfg.router_policy.allow_remote {
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                if !key.is_empty() {
+                    info!("router: Anthropic cloud provider enabled");
+                    router.add(Arc::new(AnthropicProvider::new(key)));
+                }
+            }
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+                if !key.is_empty() {
+                    info!("router: OpenAI cloud provider enabled");
+                    router.add(Arc::new(OpenAiProvider::with_api_key(key)));
+                }
+            }
+        }
+        router.add(local);
+        info!(providers = router.provider_count(), allow_remote = cfg.router_policy.allow_remote, "provider router built");
+        Arc::new(router) as Arc<dyn kiki_core::provider::LlmProvider>
     };
 
     // ── 6. Dreamer (post-session memory consolidation) ─────────────────────────

@@ -14,6 +14,9 @@ pub mod anthropic;
 pub mod openai;
 pub mod local;
 pub mod modal;
+pub mod router;
+
+pub use router::ProviderRouter;
 
 // Re-export provider trait and types so callers only need `kiki_provider`.
 pub use kiki_core::provider::{

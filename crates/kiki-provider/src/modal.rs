@@ -19,6 +19,8 @@ impl ModalProvider {
 impl LlmProvider for ModalProvider {
     fn name(&self) -> &str { "modal" }
 
+    fn is_remote(&self) -> bool { true }
+
     fn supports_model(&self, model: &str) -> bool {
         model.starts_with("modal/")
     }

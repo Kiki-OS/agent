@@ -173,20 +173,43 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    //! macOS Keychain Services backend via `security-framework`. The master key
+    //! is stored as a generic password under service `com.kiki-os.config`,
+    //! account `<user_id>`. Keychain ACLs gate access to the login session, so
+    //! a subsequent boot re-reads without a Kiki password prompt.
+
     use super::KeystoreError;
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
+
+    const SERVICE: &str = "com.kiki-os.config";
 
     pub struct Keychain;
 
     impl Keychain {
         pub fn new() -> Self { Self }
-        pub fn put(&self, _account: &str, _bytes: &[u8]) -> Result<(), KeystoreError> {
-            Err(KeystoreError::Unavailable)
+
+        pub fn put(&self, account: &str, bytes: &[u8]) -> Result<(), KeystoreError> {
+            set_generic_password(SERVICE, account, bytes)
+                .map_err(|e| KeystoreError::Backend(e.to_string()))
         }
-        pub fn get(&self, _account: &str) -> Result<Vec<u8>, KeystoreError> {
-            Err(KeystoreError::Unavailable)
+
+        pub fn get(&self, account: &str) -> Result<Vec<u8>, KeystoreError> {
+            match get_generic_password(SERVICE, account) {
+                Ok(bytes) => Ok(bytes),
+                // errSecItemNotFound (-25300) → NotFound; anything else → Backend.
+                Err(e) if e.code() == -25300 => Err(KeystoreError::NotFound(account.to_string())),
+                Err(e) => Err(KeystoreError::Backend(e.to_string())),
+            }
         }
-        pub fn forget(&self, _account: &str) -> Result<(), KeystoreError> {
-            Err(KeystoreError::Unavailable)
+
+        pub fn forget(&self, account: &str) -> Result<(), KeystoreError> {
+            match delete_generic_password(SERVICE, account) {
+                Ok(()) => Ok(()),
+                Err(e) if e.code() == -25300 => Ok(()), // already gone
+                Err(e) => Err(KeystoreError::Backend(e.to_string())),
+            }
         }
     }
 }
@@ -215,5 +238,31 @@ mod tests {
         assert_eq!(k.as_bytes(), k2.as_bytes());
         ks.forget("user-1").unwrap();
         assert!(ks.get("user-1").is_err());
+    }
+
+    /// Exercises the real platform keystore (macOS Keychain / Linux secret-service).
+    /// Gated behind `KIKI_KEYSTORE_TEST=1` because it touches the OS keychain
+    /// (may require an unlocked login keychain and isn't appropriate for CI).
+    #[test]
+    fn platform_roundtrip() {
+        if std::env::var("KIKI_KEYSTORE_TEST").as_deref() != Ok("1") {
+            eprintln!("skipped: set KIKI_KEYSTORE_TEST=1 to exercise the OS keychain");
+            return;
+        }
+        let ks = Keystore::platform();
+        let account = format!("kiki-test-{}", std::process::id());
+        let k = derive_master_key("pw", &params()).unwrap();
+
+        ks.forget(&account).ok(); // clean slate
+        ks.put(&account, &k).expect("put into OS keychain");
+        let got = ks.get(&account).expect("get from OS keychain");
+        assert_eq!(k.as_bytes(), got.as_bytes(), "keychain must round-trip the master key bytes");
+
+        // NotFound after forget.
+        ks.forget(&account).expect("forget");
+        match ks.get(&account) {
+            Err(KeystoreError::NotFound(_)) => {}
+            other => panic!("expected NotFound after forget, got {other:?}"),
+        }
     }
 }

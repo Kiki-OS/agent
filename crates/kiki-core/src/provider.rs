@@ -105,6 +105,11 @@ pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
     fn supports_model(&self, model: &str) -> bool;
 
+    /// Whether this provider sends data off-device. The router suppresses remote
+    /// providers when the node's privacy policy sets `allow_remote = false`.
+    /// Local runtimes (llama.cpp) return false; cloud APIs override to true.
+    fn is_remote(&self) -> bool { false }
+
     /// Initiate a streaming completion. Returns a stream of chunks.
     /// The caller is responsible for accumulating chunks into AssistantTurn.
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream>;

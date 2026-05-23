@@ -79,6 +79,8 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &str { "anthropic" }
 
+    fn is_remote(&self) -> bool { true }
+
     fn supports_model(&self, model: &str) -> bool {
         model.starts_with("claude-")
     }
