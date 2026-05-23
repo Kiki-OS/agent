@@ -18,11 +18,13 @@
 //!   let receiver = MigrationReceiver::new(fleet.clone(), "https://registry.kiki-os.com");
 //!   ```
 
+pub mod auth;
 pub mod client;
 pub mod sync;
 pub mod heartbeat;
 pub mod migration;
 
+pub use auth::{AuthError, DeviceCode, DeviceFlow, TokenStore};
 pub use client::FleetClient;
 pub use heartbeat::Heartbeat;
 pub use migration::{MigrationReceiver, MigrationSender, RestoredSession};

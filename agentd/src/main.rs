@@ -114,10 +114,23 @@ struct SocketsConfig {
 #[derive(Deserialize, Debug)]
 struct FleetConfig {
     enabled:   bool,
+    /// Fleet worker origin (node register + session relay), e.g.
+    /// `https://fleet.kiki-os.com`. Empty disables cloud connectivity.
     cloud_url: String,
-    #[allow(dead_code)]
+    /// Auth worker origin for device-flow enrollment, e.g.
+    /// `https://auth.kiki-os.com`. Defaults to `cloud_url` with the leading
+    /// `fleet.` host swapped for `auth.` when left empty.
+    #[serde(default)]
+    auth_url:  String,
+    /// Node flavor reported to the fleet registry (base/server/lite/desktop).
+    #[serde(default = "default_flavor")]
+    flavor:    String,
+    #[serde(default = "default_heartbeat")]
     heartbeat_interval: u64,
 }
+
+fn default_flavor()    -> String { "headless".into() }
+fn default_heartbeat() -> u64    { 30 }
 
 #[derive(Deserialize, Debug, Default)]
 struct AppsConfig {
@@ -271,10 +284,10 @@ async fn main() -> anyhow::Result<()> {
     let dreamer = Arc::new(Dreamer::new(distill_model, provider.clone()));
 
     // ── 7. Fleet client (optional) ────────────────────────────────────────────
-    if !args.no_fleet && cfg.fleet.enabled {
-        info!(cloud_url = %cfg.fleet.cloud_url, "fleet client enabled (TODO: init)");
-        // TODO: kiki_fleet::FleetClient::connect(cfg.fleet.cloud_url, state.clone()).await?
-    }
+    // Wired below (§9.5) once the control channel + event stream exist, so the
+    // cloud relay can drive sessions (web → device) and mirror agent state
+    // (device → web).
+    let fleet_enabled = !args.no_fleet && cfg.fleet.enabled && !cfg.fleet.cloud_url.is_empty();
 
     // ── 8. Control socket — listen for compositor + remote control messages ───
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(64);
@@ -339,14 +352,44 @@ async fn main() -> anyhow::Result<()> {
         control_rx,
     ).with_event_channel(ev_tx);
 
-    // Relay AgentEvents to the event bus
+    // Relay AgentEvents to the event bus, and tee a compact state mirror to the
+    // fleet relay (device → cloud → web) when fleet is enabled.
     let bus2 = bus.clone();
     let sid2  = session_id.clone();
+    let (state_tx, state_rx) = mpsc::channel::<kiki_fleet::StatePatch>(128);
     tokio::spawn(async move {
         while let Some(event) = ev_rx.recv().await {
+            if fleet_enabled {
+                // Lossy on purpose: if the relay isn't draining we drop mirror
+                // updates rather than stalling the agent loop.
+                let _ = state_tx.try_send(event_to_patch(&event));
+            }
             bus2.publish_agent(sid2.clone(), event);
         }
     });
+
+    // ── 9.5. Fleet enrollment + cloud relay ─────────────────────────────────────
+    if fleet_enabled {
+        let fleet_url = cfg.fleet.cloud_url.clone();
+        let auth_url  = resolve_auth_url(&cfg.fleet.auth_url, &fleet_url);
+        let flavor    = cfg.fleet.flavor.clone();
+        let os_version = env!("CARGO_PKG_VERSION").to_string();
+        let hb_secs   = cfg.fleet.heartbeat_interval;
+        let node_id   = derive_node_id();
+        let relay_session = node_id.clone(); // one session per node (web connects here)
+        let token_store = kiki_fleet::TokenStore::new("/var/kiki/state/fleet-token");
+        let ctrl_tx   = control_tx.clone();
+
+        info!(node_id = %node_id, fleet = %fleet_url, "fleet enabled — enrolling");
+        tokio::spawn(spawn_fleet(FleetSetup {
+            fleet_url, auth_url, flavor, os_version, hb_secs,
+            node_id, relay_session, token_store, ctrl_tx,
+            state_rx, hub: hub.clone(),
+        }));
+    } else {
+        info!("fleet disabled (no_fleet flag, disabled, or empty cloud_url)");
+        drop(state_rx);
+    }
 
     // ── 10. Run the harness ──────────────────────────���─────────────────────────
     info!(session = %session_id, "harness starting");
@@ -439,4 +482,212 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ── Fleet wiring ────────────────────────────────────────────────────────────
+
+/// Derive a stable node id: prefer the host machine-id, else a persisted random.
+fn derive_node_id() -> String {
+    for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let id = s.trim();
+            if !id.is_empty() {
+                return format!("node-{}", &id[..id.len().min(16)]);
+            }
+        }
+    }
+    // Fallback: persisted random id under the state dir.
+    let path = std::path::Path::new("/var/kiki/state/node-id");
+    if let Ok(s) = std::fs::read_to_string(path) {
+        let id = s.trim();
+        if !id.is_empty() { return id.to_string(); }
+    }
+    let id = format!("node-{}", random_hex(8));
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::write(path, &id);
+    id
+}
+
+fn random_hex(bytes: usize) -> String {
+    // /dev/urandom exists on Linux and macOS; fall back to time-based entropy.
+    let mut buf = vec![0u8; bytes];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+        .is_err()
+    {
+        let n = now_ms();
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((n >> (i % 8 * 8)) as u8) ^ (std::process::id() as u8);
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Derive the auth-worker origin from an explicit value or the fleet origin
+/// (swap the leading `fleet.` host label for `auth.`).
+fn resolve_auth_url(explicit: &str, fleet_url: &str) -> String {
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    if let Some(rest) = fleet_url.strip_prefix("https://fleet.") {
+        return format!("https://auth.{rest}");
+    }
+    if let Some(rest) = fleet_url.strip_prefix("http://fleet.") {
+        return format!("http://auth.{rest}");
+    }
+    fleet_url.to_string()
+}
+
+/// Map an [`AgentEvent`] to a compact state mirror the web renders.
+fn event_to_patch(ev: &kiki_core::harness::AgentEvent) -> kiki_fleet::StatePatch {
+    use kiki_core::harness::AgentEvent as E;
+    let status = match ev {
+        E::Thinking { .. }          => serde_json::json!({ "kind": "thinking" }),
+        E::Content { text }         => serde_json::json!({ "kind": "content", "text": text }),
+        E::ToolStart { name, .. }   => serde_json::json!({ "kind": "tool_start", "tool": name }),
+        E::ToolComplete { name, success } =>
+            serde_json::json!({ "kind": "tool_complete", "tool": name, "success": success }),
+        E::ModeChange { mode }      => serde_json::json!({ "kind": "mode_change", "mode": format!("{mode:?}") }),
+        E::Checkpoint { step, .. }  => serde_json::json!({ "kind": "checkpoint", "step": step }),
+        E::Compacting { .. }        => serde_json::json!({ "kind": "compacting" }),
+        E::Healing { attempt, .. }  => serde_json::json!({ "kind": "healing", "attempt": attempt }),
+        E::Done { steps, .. }       => serde_json::json!({ "kind": "done", "steps": steps }),
+        E::Error { error }          => serde_json::json!({ "kind": "error", "error": error }),
+    };
+    kiki_fleet::StatePatch::agent_status(status)
+}
+
+struct FleetSetup {
+    fleet_url:     String,
+    auth_url:      String,
+    flavor:        String,
+    os_version:    String,
+    hb_secs:       u64,
+    node_id:       String,
+    relay_session: String,
+    token_store:   kiki_fleet::TokenStore,
+    ctrl_tx:       mpsc::Sender<ControlMessage>,
+    state_rx:      mpsc::Receiver<kiki_fleet::StatePatch>,
+    hub:           Arc<kiki_mcp::McpHub>,
+}
+
+/// Enroll the node (device flow, persisted token), register + heartbeat, then
+/// hold the SessionDO relay: mirror agent state up (device → cloud → web) and
+/// execute remote `tool_call`s coming down (web → cloud → device).
+async fn spawn_fleet(setup: FleetSetup) {
+    let FleetSetup {
+        fleet_url, auth_url, flavor, os_version, hb_secs,
+        node_id, relay_session, token_store, ctrl_tx, mut state_rx, hub,
+    } = setup;
+
+    // ── Enrollment: token from env override → persisted store → device flow. ───
+    // `KIKI_FLEET_TOKEN` injects a Bearer token directly (provisioning / CI).
+    // `KIKI_FLEET_SKIP_ENROLL=1` registers unauthenticated (dev / headless nodes
+    // that bind to an account later).
+    let env_token = std::env::var("KIKI_FLEET_TOKEN").ok().filter(|t| !t.is_empty());
+    let skip_enroll = std::env::var("KIKI_FLEET_SKIP_ENROLL").as_deref() == Ok("1");
+    let token = if let Some(t) = env_token {
+        info!("fleet: using KIKI_FLEET_TOKEN");
+        let _ = token_store.save(&t);
+        Some(t)
+    } else if let Some(t) = token_store.load() {
+        info!("fleet: reusing persisted enrollment token");
+        Some(t)
+    } else if skip_enroll {
+        info!("fleet: KIKI_FLEET_SKIP_ENROLL set — registering unauthenticated");
+        None
+    } else {
+        let label = format!("{flavor} ({node_id})");
+        match kiki_fleet::DeviceFlow::new(&auth_url).authorize(Some(&label)).await {
+            Ok(t) => {
+                if let Err(e) = token_store.save(&t) {
+                    warn!(error = %e, "fleet: could not persist token");
+                }
+                Some(t)
+            }
+            Err(e) => {
+                warn!(error = %e, "fleet: device enrollment failed — \
+                      registering unauthenticated (node won't bind to a user)");
+                None
+            }
+        }
+    };
+
+    // ── Register + heartbeat. ──────────────────────────────────────────────────
+    let mut client = kiki_fleet::FleetClient::new(&fleet_url, &node_id)
+        .with_identity(&flavor, &os_version, None);
+    if let Some(t) = &token {
+        client = client.with_token(t.clone());
+    }
+    let client = Arc::new(client);
+
+    match client.register_self().await {
+        Ok(())  => info!(node_id = %node_id, "fleet: node registered"),
+        Err(e)  => warn!(error = %e, "fleet: initial registration failed (heartbeat will retry)"),
+    }
+    let _hb = kiki_fleet::Heartbeat::new(client.clone(), std::time::Duration::from_secs(hb_secs.max(5)))
+        .spawn();
+
+    // ── SessionDO relay with reconnect. ────────────────────────────────────────
+    loop {
+        let (publisher, mut inbound) = match kiki_fleet::connect_device(&fleet_url, &relay_session).await {
+            Ok(pair) => { info!(session = %relay_session, "fleet: session relay connected"); pair }
+            Err(e) => {
+                warn!(error = %e, "fleet: session relay connect failed — retrying in 5s");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        // Announce we're online.
+        let _ = publisher.publish_patch(&kiki_fleet::StatePatch {
+            phase: Some("active".into()),
+            ..Default::default()
+        }).await;
+
+        // Drain state mirror → relay until the socket drops.
+        loop {
+            tokio::select! {
+                patch = state_rx.recv() => match patch {
+                    Some(p) => { if publisher.publish_patch(&p).await.is_err() { break; } }
+                    None    => return, // agent shut down
+                },
+                msg = inbound.recv() => match msg {
+                    Some(kiki_fleet::DeviceInbound::ToolCall { request_id, tool, input }) => {
+                        info!(request_id = %request_id, tool = %tool, "fleet: remote tool_call");
+                        let hub2 = hub.clone();
+                        let pub2 = publisher.clone();
+                        // Run the tool off the relay loop so a slow tool doesn't
+                        // stall state mirroring.
+                        tokio::spawn(async move {
+                            match hub2.call(&tool, input).await {
+                                Ok(result) => { let _ = pub2.tool_result(&request_id, result, None).await; }
+                                Err(e)     => { let _ = pub2.tool_result(&request_id, serde_json::Value::Null, Some(e.to_string())).await; }
+                            }
+                        });
+                    }
+                    Some(kiki_fleet::DeviceInbound::InterruptResponse { interrupt_id, resolution }) => {
+                        // Forward the human's decision into the harness control loop.
+                        let _ = ctrl_tx.send(ControlMessage::ApprovalResponse {
+                            request_id: interrupt_id,
+                            decision:   approval_from_resolution(&resolution),
+                        }).await;
+                    }
+                    None => break, // relay dropped → reconnect
+                },
+            }
+        }
+        warn!("fleet: session relay dropped — reconnecting");
+    }
+}
+
+fn approval_from_resolution(v: &serde_json::Value) -> kiki_core::types::ApprovalDecision {
+    use kiki_core::types::ApprovalDecision;
+    let s = v.get("decision").and_then(|d| d.as_str())
+        .or_else(|| v.as_str())
+        .unwrap_or("");
+    match s {
+        "approve" | "approved" | "allow" | "yes" => ApprovalDecision::Approved,
+        _ => ApprovalDecision::Rejected,
+    }
 }

@@ -35,9 +35,9 @@ impl Heartbeat {
     }
 
     async fn tick(&self) -> Result<()> {
-        // Re-register refreshes the KV TTL, keeping the node online.
-        // TODO: pass real flavor/os_version from config.
-        self.fleet.register("desktop", "0.1.0").await?;
+        // Re-register refreshes the KV TTL (120s), keeping the node online and
+        // reporting its real identity (flavor/os_version) and ownership token.
+        self.fleet.register_self().await?;
         tracing::debug!(node_id = self.fleet.node_id(), "heartbeat sent");
         Ok(())
     }

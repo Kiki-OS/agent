@@ -8,21 +8,67 @@ use serde_json::Value;
 /// HTTP client for the kiki-cloud fleet worker.
 /// Wraps all fleet API calls; used by heartbeat, sync, and migration modules.
 pub struct FleetClient {
-    base_url: String,
-    node_id:  String,
-    http:     reqwest::Client,
+    base_url:   String,
+    node_id:    String,
+    http:       reqwest::Client,
+    /// Bearer token bound to the owning user (from device-flow auth). When set,
+    /// `register` binds the node to that user/org so it surfaces in the
+    /// authenticated fleet view; unauthenticated registration falls back to the
+    /// "system" placeholder owner.
+    token:      Option<String>,
+    /// Node identity reported on (re-)registration.
+    flavor:     String,
+    os_version: String,
+    name:       Option<String>,
 }
 
 impl FleetClient {
     pub fn new(base_url: impl Into<String>, node_id: impl Into<String>) -> Self {
         Self {
-            base_url: base_url.into(),
-            node_id:  node_id.into(),
-            http:     reqwest::Client::new(),
+            base_url:   base_url.into(),
+            node_id:    node_id.into(),
+            http:       reqwest::Client::new(),
+            token:      None,
+            flavor:     "desktop".into(),
+            os_version: "0.1.0".into(),
+            name:       None,
         }
     }
 
+    /// Attach a Bearer token (from device-flow auth) for ownership binding.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Set the identity reported on registration/heartbeat.
+    pub fn with_identity(
+        mut self,
+        flavor:     impl Into<String>,
+        os_version: impl Into<String>,
+        name:       Option<String>,
+    ) -> Self {
+        self.flavor     = flavor.into();
+        self.os_version = os_version.into();
+        self.name       = name;
+        self
+    }
+
     pub fn node_id(&self) -> &str { &self.node_id }
+    pub fn flavor(&self) -> &str { &self.flavor }
+    pub fn os_version(&self) -> &str { &self.os_version }
+
+    /// Register (or refresh) this node using its stored identity.
+    pub async fn register_self(&self) -> Result<()> {
+        let mut body = serde_json::json!({
+            "flavor":     self.flavor,
+            "os_version": self.os_version,
+        });
+        if let Some(name) = &self.name {
+            body["name"] = serde_json::Value::String(name.clone());
+        }
+        self.post(&format!("/v1/fleet/nodes/{}/register", self.node_id), body).await
+    }
 
     pub async fn register(&self, flavor: &str, os_version: &str) -> Result<()> {
         self.post(
@@ -89,9 +135,11 @@ impl FleetClient {
 
     async fn post(&self, path: &str, body: Value) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
-        self.http.post(&url)
-            .json(&body)
-            .send().await.map_err(fleet_err)?
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        req.send().await.map_err(fleet_err)?
             .error_for_status().map_err(fleet_err)?;
         Ok(())
     }
