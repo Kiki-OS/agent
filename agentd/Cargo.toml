@@ -1,0 +1,27 @@
+[package]
+name        = "agentd"
+description = "Kiki OS agentic daemon — the process that orchestrates everything"
+edition.workspace = true
+workspace   = "./.."
+
+[[bin]]
+name = "agentd"
+path = "src/main.rs"
+
+[dependencies]
+kiki-core        = { workspace = true }
+kiki-mcp         = { workspace = true }
+kiki-provider    = { workspace = true }
+kiki-sandbox     = { workspace = true }
+kiki-state       = { workspace = true }
+kiki-orchestrator = { workspace = true }
+kiki-fleet       = { workspace = true }
+kiki-telemetry   = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+anyhow           = { workspace = true }
+clap             = { version = "4", features = ["derive"] }
+toml             = "0.8"
+async-trait      = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name        = "kiki-core"
+description = "Agentic harness, tool registry, provider trait, and shared types for Kiki OS"
+edition.workspace = true
+workspace   = "./../.."
+
+[dependencies]
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }

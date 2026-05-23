@@ -1,0 +1,16 @@
+[package]
+name        = "kiki-fleet"
+description = "Fleet management client — syncs config from cloud control plane, reports telemetry"
+edition.workspace = true
+workspace   = "./../.."
+
+[dependencies]
+kiki-core        = { workspace = true }
+kiki-orchestrator = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+reqwest     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }

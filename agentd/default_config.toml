@@ -1,0 +1,36 @@
+[inference]
+default_model    = "llama-3.2-3b-instruct"
+distill_model    = "llama-3.2-1b-instruct"
+llama_server_bin = "llama-server"
+local_model_dir  = "/var/kiki/models"
+idle_ttl_secs    = 300
+max_slots        = 2
+context_size     = 8192
+
+[router_policy]
+allow_remote                     = false
+allow_third_party_remote         = false
+default_privacy_level            = "local"
+preferred_model                  = "llama3.2"
+disable_remote_below_battery_pct = 20
+disable_third_party_for_voice    = true
+trace_decisions                  = false
+
+[control_mode]
+default                         = "agent_mode"
+allow_remote_bypass             = false
+bypass_checkpoint_interval_secs = 5
+
+[sockets]
+mcp     = "/run/kiki/mcp.sock"
+a11y    = "/run/kiki/a11y.sock"
+memory  = "/run/kiki/memory.sock"
+control = "/run/kiki/control.sock"
+
+[fleet]
+enabled            = false
+cloud_url          = "https://fleet.kiki-os.com"
+heartbeat_interval = 30
+
+[apps]
+dir = "/var/kiki/apps"

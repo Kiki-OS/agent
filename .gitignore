@@ -1,0 +1,20 @@
+# Build output
+/target
+.cargo/credentials.toml
+
+# Secrets
+.env
+.env.local
+.env.*.local
+secrets/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Debug
+*.pdb

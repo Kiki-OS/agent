@@ -1,0 +1,18 @@
+[package]
+name        = "kiki-mcp"
+description = "MCP protocol hub — Unix socket server, tool registry, streaming parser, plugin loader"
+edition.workspace = true
+workspace   = "./../.."
+
+[dependencies]
+kiki-core   = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+toml        = "0.8"
+lazy_static = "1.5"
+regex       = "1.10"

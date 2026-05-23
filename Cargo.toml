@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "agentd",
+    "crates/kiki-core",
+    "crates/kiki-mcp",
+    "crates/kiki-provider",
+    "crates/kiki-sandbox",
+    "crates/kiki-state",
+    "crates/kiki-orchestrator",
+    "crates/kiki-fleet",
+    "crates/kiki-telemetry",
+    "crates/kiki-config",
+    "crates/kiki-vault",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+repository  = "https://github.com/kiki-os/kiki-agent"
+rust-version = "1.86"
+
+[workspace.dependencies]
+# async
+tokio        = { version = "1",   features = ["full"] }
+async-trait  = "0.1"
+futures      = "0.3"
+tokio-stream = "0.1"
+
+# serde
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+schemars     = { version = "0.8", features = ["derive"] }
+
+# errors + logging
+thiserror    = "1"
+anyhow       = "1"
+tracing      = "0.1"
+
+# http
+reqwest      = { version = "0.12", features = ["json", "stream"] }
+
+# config
+toml         = "0.8"
+
+# internal workspace crates
+kiki-core        = { path = "crates/kiki-core" }
+kiki-mcp         = { path = "crates/kiki-mcp" }
+kiki-provider    = { path = "crates/kiki-provider" }
+kiki-sandbox     = { path = "crates/kiki-sandbox" }
+kiki-state       = { path = "crates/kiki-state" }
+kiki-orchestrator = { path = "crates/kiki-orchestrator" }
+kiki-fleet       = { path = "crates/kiki-fleet" }
+kiki-telemetry   = { path = "crates/kiki-telemetry" }
+kiki-config      = { path = "crates/kiki-config" }
+kiki-vault       = { path = "crates/kiki-vault" }
+
+[profile.release]
+lto           = true
+strip         = true
+codegen-units = 1
+opt-level     = 3

@@ -1,0 +1,30 @@
+[package]
+name              = "kiki-config"
+description       = "Hybrid E2E config + secrets sync engine for Kiki (Argon2id + XChaCha20-Poly1305 + revisioned scopes)"
+edition.workspace = true
+workspace         = "./../.."
+
+[dependencies]
+tokio          = { workspace = true }
+async-trait    = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+reqwest        = { workspace = true }
+
+# crypto
+argon2         = "0.5"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+rand           = { version = "0.8", features = ["std", "std_rng"] }
+zeroize        = { version = "1", features = ["zeroize_derive"] }
+subtle         = "2"
+hex            = "0.4"
+base64         = "0.22"
+
+# BIP39 for recovery codes
+bip39          = { version = "2", default-features = false, features = ["std", "rand"] }
+
+[dev-dependencies]
+hex-literal    = "0.4"
+tokio          = { workspace = true, features = ["macros", "rt-multi-thread"] }

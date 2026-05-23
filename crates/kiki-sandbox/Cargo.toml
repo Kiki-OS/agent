@@ -1,0 +1,15 @@
+[package]
+name        = "kiki-sandbox"
+description = "Sandboxing and capability broker — namespaces/seccomp for native apps, Firecracker for LLM-generated code"
+edition.workspace = true
+workspace   = "./../.."
+
+[dependencies]
+kiki-core   = { workspace = true }
+tokio       = { workspace = true }
+async-trait = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+nix         = { version = "0.29", features = ["process", "signal", "mount", "user"] }
