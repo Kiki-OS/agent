@@ -221,8 +221,9 @@ async fn main() -> anyhow::Result<()> {
     // ── 3. Plugin loader — scan /var/kiki/apps for installed artifacts ────────
     let granted = CapabilitySet::new(); // TODO: load from node policy file
     let loader  = PluginLoader::new(hub.clone(), granted.clone(), &cfg.sockets.mcp);
-    let loaded  = loader.load_directory(&cfg.apps.dir).await;
-    info!(artifacts = loaded, dir = %cfg.apps.dir, "artifacts loaded");
+    // Keep the spawned artifact processes alive for the lifetime of agentd.
+    let _app_children = loader.load_directory(&cfg.apps.dir).await;
+    info!(artifacts = _app_children.len(), dir = %cfg.apps.dir, "artifacts loaded (with exec)");
 
     // ── 4. Event bus ─────────���───────────────────────────────────────────────
     let bus       = EventBus::new();

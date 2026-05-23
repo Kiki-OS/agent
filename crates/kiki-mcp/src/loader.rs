@@ -7,6 +7,7 @@
 //! 4. Registers the artifact with the McpHub
 
 use std::{path::PathBuf, sync::Arc};
+use tokio::process::{Child, Command};
 use tracing::{error, info, warn};
 use kiki_core::{
     capability::CapabilitySet,
@@ -23,6 +24,10 @@ pub struct ArtifactManifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub tools: Vec<ToolDecl>,
+    /// How to launch the artifact process. Optional: an artifact may instead be
+    /// started by an external supervisor (systemd) and just connect to the MCP
+    /// socket on its own.
+    pub exec: Option<ExecSpec>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -36,6 +41,14 @@ pub struct ArtifactMeta {
 pub struct ToolDecl {
     pub name:        String,
     pub description: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ExecSpec {
+    /// Binary to run. Relative paths resolve against the artifact directory.
+    pub command: String,
+    #[serde(default)]
+    pub args:    Vec<String>,
 }
 
 // ─── PluginLoader ─────────────────────────────────────────────────────────────
@@ -56,23 +69,30 @@ impl PluginLoader {
     }
 
     /// Load all artifacts from an OSTree checkout root (e.g. /var/kiki/apps).
-    pub async fn load_directory(&self, root: &str) -> usize {
-        let mut loaded = 0;
-        let Ok(entries) = std::fs::read_dir(root) else { return 0; };
+    /// Returns the child processes the loader spawned (those with an `[exec]`
+    /// block); the caller must keep them alive for the artifacts to stay up.
+    pub async fn load_directory(&self, root: &str) -> Vec<Child> {
+        let mut children = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else { return children; };
 
         for entry in entries.flatten() {
             let manifest_path = entry.path().join("kiki.toml");
             if !manifest_path.exists() { continue; }
             match self.load_artifact(manifest_path).await {
-                Ok(id) => { info!(artifact = %id, "artifact loaded"); loaded += 1; }
+                Ok((id, child)) => {
+                    info!(artifact = %id, spawned = child.is_some(), "artifact loaded");
+                    if let Some(c) = child { children.push(c); }
+                }
                 Err(e) => { error!(path = ?entry.path(), error = %e, "artifact load failed"); }
             }
         }
-        loaded
+        children
     }
 
-    /// Load a single artifact from its kiki.toml path.
-    pub async fn load_artifact(&self, manifest_path: PathBuf) -> Result<String> {
+    /// Load a single artifact from its kiki.toml path. Validates capabilities,
+    /// and if the manifest has an `[exec]` block, spawns the artifact process
+    /// (with `KIKI_MCP_SOCKET` set so it connects back to this hub).
+    pub async fn load_artifact(&self, manifest_path: PathBuf) -> Result<(String, Option<Child>)> {
         let raw = std::fs::read_to_string(&manifest_path)
             .map_err(|e| Error::Io(e.to_string()))?;
 
@@ -92,10 +112,6 @@ impl PluginLoader {
         }
 
         let artifact_id = manifest.artifact.id.clone();
-
-        // The artifact process is expected to connect to the MCP socket on its own.
-        // The loader just validates and logs; the McpServer handles the connection.
-        // For headless/embedded artifacts, we'd spawn a process here.
         info!(
             artifact = %artifact_id,
             version  = %manifest.artifact.version,
@@ -104,6 +120,27 @@ impl PluginLoader {
             "artifact manifest validated"
         );
 
-        Ok(artifact_id)
+        // Spawn the artifact process if it declares how to launch. Otherwise an
+        // external supervisor (systemd) starts it and it connects on its own.
+        let child = match &manifest.exec {
+            Some(spec) => {
+                let dir = manifest_path.parent().map(PathBuf::from).unwrap_or_default();
+                let command = {
+                    let p = PathBuf::from(&spec.command);
+                    if p.is_absolute() { p } else { dir.join(&spec.command) }
+                };
+                let child = Command::new(&command)
+                    .args(&spec.args)
+                    .current_dir(&dir)
+                    .env("KIKI_MCP_SOCKET", &self.socket_dir)
+                    .spawn()
+                    .map_err(|e| Error::Io(format!("spawn {}: {e}", command.display())))?;
+                info!(artifact = %artifact_id, command = %command.display(), pid = child.id(), "artifact process spawned");
+                Some(child)
+            }
+            None => None,
+        };
+
+        Ok((artifact_id, child))
     }
 }
