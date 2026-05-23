@@ -1014,6 +1014,7 @@ dependencies = [
  "async-trait",
  "futures",
  "kiki-core",
+ "kiki-state",
  "reqwest",
  "serde",
  "serde_json",

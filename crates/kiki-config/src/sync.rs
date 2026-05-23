@@ -62,6 +62,13 @@ struct WriteResponse {
     pub revision: Revision,
 }
 
+/// Conflict body shape returned by the config worker on a CAS failure (412/409).
+/// The server reports the current revision under `current_revision`.
+#[derive(Debug, Clone, Deserialize)]
+struct ConflictBody {
+    current_revision: Revision,
+}
+
 #[derive(Debug, Error)]
 pub enum SyncError {
     #[error("http: {0}")]
@@ -175,11 +182,10 @@ impl SyncClient {
                 Ok(body.revision)
             }
             StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
-                // The server SHOULD return the current revision in the body.
-                let body: WriteResponse = resp.json().await.unwrap_or(WriteResponse {
-                    revision: Revision::ZERO,
-                });
-                Err(SyncError::Conflict { current: body.revision })
+                let current = resp.json::<ConflictBody>().await
+                    .map(|b| b.current_revision)
+                    .unwrap_or(Revision::ZERO);
+                Err(SyncError::Conflict { current })
             }
             s => Err(SyncError::Status(s)),
         }
@@ -206,10 +212,10 @@ impl SyncClient {
         match resp.status() {
             s if s.is_success() => Ok(()),
             StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
-                let body: WriteResponse = resp.json().await.unwrap_or(WriteResponse {
-                    revision: Revision::ZERO,
-                });
-                Err(SyncError::Conflict { current: body.revision })
+                let current = resp.json::<ConflictBody>().await
+                    .map(|b| b.current_revision)
+                    .unwrap_or(Revision::ZERO);
+                Err(SyncError::Conflict { current })
             }
             StatusCode::NOT_FOUND => Err(SyncError::NotFound(key.to_string())),
             s => Err(SyncError::Status(s)),

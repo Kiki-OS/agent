@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use crate::{
-    capability::{Capability, CapabilitySet},
+    capability::CapabilitySet,
     context::ControlMode,
     error::Result,
     interrupt::{Interrupt, InterruptKind},
@@ -43,6 +43,34 @@ const DESTRUCTIVE_TOOLS: &[&str] = &[
 
 fn is_destructive(tool_name: &str) -> bool {
     DESTRUCTIVE_TOOLS.contains(&tool_name)
+}
+
+/// Maps a tool name to the capability variant it requires, if any.
+///
+/// Returned values are capability *variant* names (matched via
+/// [`CapabilitySet::has_by_name`], which treats `"FsRead"` as matching any
+/// `FsRead(_)` grant). Tools absent from this table require no special
+/// capability — pure-compute or read-only informational tools (`get_weather`,
+/// `echo`, calculators) pass the static check unconditionally.
+fn required_capability(tool_name: &str) -> Option<&'static str> {
+    let cap = match tool_name {
+        "fs_read" | "fs_list" | "fs_stat"                       => "FsRead",
+        "fs_write" | "fs_delete" | "fs_move" | "fs_mkdir"       => "FsWrite",
+        "process_spawn" | "shell_exec"                          => "ProcessSpawn",
+        "process_kill"                                          => "ProcessKill",
+        "network_outbound_get" | "network_outbound_post"
+            | "http_fetch"                                      => "NetworkOutbound",
+        "audio_play"                                            => "AudioOutput",
+        "audio_record"                                          => "AudioInput",
+        "agent_spawn"                                           => "AgentSpawn",
+        "agent_kill"                                            => "AgentKill",
+        "secrets_read"                                          => "SecretsRead",
+        "wayland_input_inject"                                  => "WaylandInput",
+        "fleet_control"                                         => "FleetControl",
+        s if s.starts_with("systemd_unit_")                    => "SystemdUnit",
+        _ => return None,
+    };
+    Some(cap)
 }
 
 // ─── Capability gate ──────────────────────────────────────────────────────────
@@ -84,10 +112,19 @@ impl CapabilityGate {
         mode:    ControlMode,
         bypass:  bool,
     ) -> Result<GateDecision> {
-        // 1. Static capability check (always enforced, regardless of ControlMode)
-        let cap_result = self.capabilities.check(&Capability::ProcessSpawn, bypass); // placeholder
-        // Real implementation maps tool names → required capabilities
-        let _ = cap_result; // TODO: full tool→cap mapping table
+        // 1. Static capability check (enforced in every mode except bypass).
+        //    Deny-by-default: a tool that maps to a capability the session was
+        //    not granted is skipped regardless of ControlMode.
+        if !bypass {
+            if let Some(required) = required_capability(&call.name) {
+                if !self.capabilities.has_by_name(required) {
+                    self.audit_decision(call, AuditAction::Denied);
+                    return Ok(GateDecision::Skip {
+                        reason: format!("missing capability: {required}"),
+                    });
+                }
+            }
+        }
 
         // 2. ControlMode policy
         let decision = match mode {
@@ -243,4 +280,67 @@ fn uuid_v4_simple() -> String {
     let mut h = DefaultHasher::new();
     now_ms().hash(&mut h);
     format!("{:x}", h.finish())
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::Capability;
+    use serde_json::json;
+
+    fn gate(caps: CapabilitySet) -> Arc<CapabilityGate> {
+        // Receiver is dropped; approval paths aren't exercised in these tests.
+        let (tx, _rx) = mpsc::channel::<SurfaceSignal>(8);
+        CapabilityGate::new(caps, tx)
+    }
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall { id: "c1".into(), name: name.into(), input: json!({}) }
+    }
+
+    #[tokio::test]
+    async fn unmapped_tool_proceeds_without_capability() {
+        let g = gate(CapabilitySet::new());
+        let d = g.check(&call("get_weather"), ControlMode::AgentMode, false).await.unwrap();
+        assert!(matches!(d, GateDecision::Proceed));
+    }
+
+    #[tokio::test]
+    async fn sensitive_tool_denied_without_grant() {
+        let g = gate(CapabilitySet::new());
+        let d = g.check(&call("fs_write"), ControlMode::AgentMode, false).await.unwrap();
+        match d {
+            GateDecision::Skip { reason } => assert!(reason.contains("FsWrite"), "got: {reason}"),
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        assert_eq!(g.audit_log().last().unwrap().action, AuditAction::Denied);
+    }
+
+    #[tokio::test]
+    async fn sensitive_tool_allowed_with_grant() {
+        let mut caps = CapabilitySet::new();
+        caps.insert(Capability::FsWrite("/var/kiki".into()));
+        let g = gate(caps);
+        // Granted FsWrite(_) matches the "FsWrite" requirement by variant name.
+        let d = g.check(&call("fs_write"), ControlMode::AgentMode, false).await.unwrap();
+        assert!(matches!(d, GateDecision::Proceed));
+    }
+
+    #[tokio::test]
+    async fn bypass_skips_capability_enforcement() {
+        let g = gate(CapabilitySet::new());
+        // Even with no grant, BypassPermissions (bypass=true) proceeds.
+        let d = g.check(&call("fs_write"), ControlMode::BypassPermissions, true).await.unwrap();
+        assert!(matches!(d, GateDecision::Proceed));
+        assert_eq!(g.audit_log().last().unwrap().action, AuditAction::Bypassed);
+    }
+
+    #[tokio::test]
+    async fn systemd_prefix_requires_capability() {
+        let g = gate(CapabilitySet::new());
+        let d = g.check(&call("systemd_unit_restart"), ControlMode::AgentMode, false).await.unwrap();
+        assert!(matches!(d, GateDecision::Skip { .. }));
+    }
 }
