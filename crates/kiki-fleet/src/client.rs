@@ -92,11 +92,26 @@ impl FleetClient {
         self.post(&format!("/v1/fleet/sessions/{}/migrate", session_id), body).await
     }
 
+    /// Upload a captured MigrationBundle as the contents of a fleet snapshot.
+    /// The cloud indexes it and stores the bundle in R2 so instances can boot
+    /// from it (PUT /v1/snapshots/:id/bundle).
+    pub async fn upload_snapshot(&self, snapshot_id: &str, bundle: &MigrationBundle) -> Result<()> {
+        let url  = format!("{}/v1/snapshots/{}/bundle", self.base_url, snapshot_id);
+        let body = serde_json::to_value(bundle).map_err(Error::Json)?;
+        let mut req = self.http.put(&url).json(&body);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        req.send().await.map_err(fleet_err)?
+            .error_for_status().map_err(fleet_err)?;
+        Ok(())
+    }
+
     /// Poll for MigrationBundles addressed to this node.
     /// Returns `(session_id, bundle)` pairs.
     pub async fn poll_migrations(&self) -> Result<Vec<(String, MigrationBundle)>> {
         let url = format!("{}/v1/fleet/nodes/{}/migrations", self.base_url, self.node_id);
-        let items = self.http.get(&url)
+        let items = self.bearer(self.http.get(&url))
             .send().await.map_err(fleet_err)?
             .error_for_status().map_err(fleet_err)?
             .json::<Vec<PendingItem>>().await.map_err(fleet_err)?;
@@ -126,20 +141,25 @@ impl FleetClient {
             "{}/v1/fleet/nodes/{}/migrations/{}",
             self.base_url, self.node_id, session_id,
         );
-        self.http.delete(&url).send().await.map_err(fleet_err)?
+        self.bearer(self.http.delete(&url)).send().await.map_err(fleet_err)?
             .error_for_status().map_err(fleet_err)?;
         Ok(())
     }
 
     // ── internal ───────────────────────────────────────────────────────────────
 
+    /// Attach the Bearer token to a request when one is enrolled.
+    fn bearer(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
     async fn post(&self, path: &str, body: Value) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
-        }
-        req.send().await.map_err(fleet_err)?
+        self.bearer(self.http.post(&url).json(&body))
+            .send().await.map_err(fleet_err)?
             .error_for_status().map_err(fleet_err)?;
         Ok(())
     }

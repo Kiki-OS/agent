@@ -40,7 +40,7 @@ async fn device_state_reaches_cloud_and_app() {
     let session_id = format!("relay-{nonce}");
 
     // ── 1. Device connects and publishes its live state. ──────────────────────
-    let (device, _inbound) = connect_device(&base, &session_id).await.expect("device connect");
+    let (device, _inbound) = connect_device(&base, &session_id, None).await.expect("device connect");
     device.publish_patch(&StatePatch {
         phase:        Some("active".into()),
         agent_status: Some(json!("thinking")),

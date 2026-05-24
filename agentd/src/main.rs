@@ -172,6 +172,73 @@ impl kiki_provider::local::WeightsResolver for StaticDirResolver {
     }
 }
 
+// ── Egress audit ───────────────────────────────────────────────────────────────
+// The broker is the single auditable egress point; for now we log each brokered
+// request. A durable sink (fleet/vault) can replace this later.
+struct TracingEgressAudit;
+
+#[async_trait::async_trait]
+impl kiki_net::AuditSink for TracingEgressAudit {
+    async fn record(&self, e: &kiki_net::EgressAudit) {
+        info!(
+            app = %e.app, method = %e.method, host = %e.host, port = e.port,
+            status = e.status, bytes = e.bytes, "egress"
+        );
+    }
+}
+
+// ── Credential injection (OAuth → sealed Secrets) ────────────────────────────
+// Build the egress broker's credential injector backed by an on-device sealed
+// secret store. Provider client ids/secrets come from the environment (set per
+// deployment); device endpoints are the well-known Google/Microsoft ones.
+fn build_credential_injector() -> Option<Arc<dyn kiki_net::CredentialInjector>> {
+    use kiki_oauth::{OAuthFlow, Provider, ProviderConfig, SealedFileSecretStore, SecretsCredentialInjector};
+
+    let key = node_master_key()?;
+    let store = SealedFileSecretStore::new(key, "/var/kiki/secrets");
+    let flow = OAuthFlow::new(store)
+        .with_provider(Provider::Google, ProviderConfig {
+            token_url:                "https://oauth2.googleapis.com/token".into(),
+            device_authorization_url: Some("https://oauth2.googleapis.com/device/code".into()),
+            client_id:                std::env::var("KIKI_GOOGLE_CLIENT_ID").unwrap_or_default(),
+            client_secret:            std::env::var("KIKI_GOOGLE_CLIENT_SECRET").ok(),
+            scopes:                   vec!["https://mail.google.com/".into()],
+        })
+        .with_provider(Provider::Microsoft, ProviderConfig {
+            token_url:                "https://login.microsoftonline.com/common/oauth2/v2.0/token".into(),
+            device_authorization_url: Some("https://login.microsoftonline.com/common/oauth2/v2.0/devicecode".into()),
+            client_id:                std::env::var("KIKI_MS_CLIENT_ID").unwrap_or_default(),
+            client_secret:            None,
+            scopes:                   vec!["offline_access".into(), "https://outlook.office.com/IMAP.AccessAsUser.All".into()],
+        });
+    // Account→host mappings are registered by the settings/OAuth flow as users
+    // connect accounts; none are wired at boot.
+    Some(Arc::new(SecretsCredentialInjector::new(Arc::new(flow))))
+}
+
+/// The node's master key for sealing on-device secrets. Interim: a 0600 key file
+/// under /var/kiki/secrets, generated on first use. TODO(hardening): back this
+/// with the platform keystore / TPM instead of a file.
+fn node_master_key() -> Option<kiki_config::crypto::MasterKey> {
+    use rand::RngCore;
+    let path = std::path::Path::new("/var/kiki/secrets/.node-key");
+    if let Ok(b) = std::fs::read(path) {
+        if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
+            return Some(kiki_config::crypto::MasterKey::from_bytes(arr));
+        }
+    }
+    let mut k = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut k);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(path, k).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Some(kiki_config::crypto::MasterKey::from_bytes(k))
+}
+
 fn sanitize_model_id(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
@@ -190,7 +257,16 @@ async fn main() -> anyhow::Result<()> {
             warn!(path = ?args.config, "config not found — using defaults");
             include_str!("../default_config.toml").into()
         });
-    let cfg: Config = toml::from_str(&raw)?;
+    let mut cfg: Config = toml::from_str(&raw)?;
+    // Provisioning overrides (cloud-init / fleet): an env var wins over the baked
+    // toml so a server node can be pointed at its control plane without rewriting
+    // the config file. KIKI_FLEET_TOKEN is consumed later in fleet enrollment.
+    if let Ok(url) = std::env::var("KIKI_FLEET_URL") {
+        if !url.is_empty() {
+            info!(cloud_url = %url, "fleet cloud_url overridden by KIKI_FLEET_URL");
+            cfg.fleet.cloud_url = url;
+        }
+    }
 
     let control_mode = parse_control_mode(&cfg.control_mode.default);
     let model = if cfg.router_policy.allow_remote {
@@ -206,24 +282,85 @@ async fn main() -> anyhow::Result<()> {
         "agentd starting"
     );
 
-    // ── 1. Durable state backend ────────────────────────────────���─────────────
-    // Production: OstreeBackend. Dev/test: MemoryBackend.
-    let state = Arc::new(MemoryBackend::default());
-    info!("state backend: memory (dev mode)");
+    // ── 1. Durable state backend ──────────────────────────────────────────────
+    // Durable file-backed state under /var/kiki/state survives restart + reboot.
+    // Falls back to in-memory only if the state dir is unusable (dev/CI).
+    let state_dir = std::env::var("KIKI_STATE_DIR").unwrap_or_else(|_| "/var/kiki/state".into());
+    let state: Arc<dyn kiki_core::state::StateBackend> =
+        match kiki_state::FileBackend::open(&state_dir) {
+            Ok(b) => {
+                info!(dir = %state_dir, "state backend: file (durable)");
+                Arc::new(b)
+            }
+            Err(e) => {
+                warn!(dir = %state_dir, error = %e, "durable state unavailable — using memory");
+                Arc::new(MemoryBackend::default())
+            }
+        };
 
     // ── 2. MCP hub + Unix socket server ────────────────────────────��─────────
-    let hub = Arc::new(McpHub::new());
-    let mcp_server = McpServer::new(hub.clone(), cfg.sockets.mcp.clone());
+    // Ensure the runtime socket dir exists. systemd creates /run/kiki via
+    // RuntimeDirectory=, but agentd must also work when launched directly
+    // (containers, dev, provisioning tools).
+    for sock in [&cfg.sockets.mcp, &cfg.sockets.control] {
+        if let Some(dir) = std::path::Path::new(sock).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+
+    // The catalog notifier fires on every artifact register/unregister so the
+    // shell's command palette + launcher refresh when apps load after boot.
+    let (hub_inner, mut catalog_rx) = McpHub::new().with_catalog_notifier();
+    let hub = Arc::new(hub_inner);
+
+    // Egress broker: the single audited network-egress point. Seed each installed
+    // app's allowlist from its manifest's [capabilities].network so `net.fetch`
+    // is deny-by-default per app. (Credential injection from Secrets lands with
+    // the OAuth unlock; for now no injector is wired.)
+    let broker = {
+        let mut b = kiki_net::EgressBroker::new().with_audit(Arc::new(TracingEgressAudit));
+        for (app_id, hosts) in kiki_mcp::scan_egress_allowlists(&cfg.apps.dir) {
+            info!(app = %app_id, hosts = hosts.len(), "egress allowlist registered");
+            b.allow(app_id, hosts);
+        }
+        // Wire per-account credential injection (OAuth → sealed Secrets). The
+        // broker injects bearer tokens into authenticated requests without ever
+        // exposing them to the app. Mappings are added when accounts are
+        // authorized; with none configured the injector is a no-op.
+        if let Some(injector) = build_credential_injector() {
+            b = b.with_injector(injector);
+            info!("credential injector wired (sealed secret store)");
+        }
+        Arc::new(b)
+    };
+
+    let mcp_server = McpServer::new(hub.clone(), cfg.sockets.mcp.clone())
+        .with_broker(broker.clone());
     let _mcp_handle = mcp_server.serve().await
         .map_err(|e| anyhow::anyhow!("MCP server failed to start: {e}"))?;
     info!(socket = %cfg.sockets.mcp, "MCP server started");
 
     // ── 3. Plugin loader — scan /var/kiki/apps for installed artifacts ────────
-    let granted = CapabilitySet::new(); // TODO: load from node policy file
+    // Capabilities the operator granted to installed artifacts (written by kpkg
+    // on approval). Deny-by-default when the policy file is absent.
+    let policy_path = std::env::var("KIKI_POLICY_FILE")
+        .unwrap_or_else(|_| "/etc/kiki/policy.json".to_string());
+    let granted = load_granted_caps(&policy_path);
     let loader  = PluginLoader::new(hub.clone(), granted.clone(), &cfg.sockets.mcp);
+    // Built-in apps (baked, trusted) load from cfg.apps.dir. User-installed L2
+    // apps load from /var/kiki/apps, validated against the granted policy.
     // Keep the spawned artifact processes alive for the lifetime of agentd.
-    let _app_children = loader.load_directory(&cfg.apps.dir).await;
-    info!(artifacts = _app_children.len(), dir = %cfg.apps.dir, "artifacts loaded (with exec)");
+    let mut _app_children = loader.load_directory(&cfg.apps.dir, true).await;
+    let builtin_count = _app_children.len();
+    let l2_dir = "/var/kiki/apps";
+    if l2_dir != cfg.apps.dir {
+        _app_children.extend(loader.load_directory(l2_dir, false).await);
+    }
+    info!(
+        builtin = builtin_count,
+        l2 = _app_children.len() - builtin_count,
+        "artifacts loaded (with exec)"
+    );
 
     // ── 4. Event bus ─────────���───────────────────────────────────────────────
     let bus       = EventBus::new();
@@ -295,14 +432,23 @@ async fn main() -> anyhow::Result<()> {
     // node id is derived from the session so the source can address the
     // migration bundle to us and our poll finds it.
     let resume_session = std::env::var("KIKI_RESUME_SESSION").ok().filter(|s| !s.is_empty());
-    let node_id = match &resume_session {
-        Some(s) => format!("cloud-{s}"),
-        None    => derive_node_id(),
+    // Node identity precedence:
+    //   1. KIKI_NODE_ID — set by the cloud orchestrator (fleet instance / migrated
+    //      session); the migration pointer + group membership are keyed by it.
+    //   2. cloud-<session> — legacy migrated-session fallback.
+    //   3. a stable host-derived id for an on-device node.
+    let node_id = match (std::env::var("KIKI_NODE_ID").ok().filter(|s| !s.is_empty()), &resume_session) {
+        (Some(n), _)    => n,
+        (None, Some(s)) => format!("cloud-{s}"),
+        (None, None)    => derive_node_id(),
     };
 
-    // ── 8. Control socket — listen for compositor + remote control messages ───
+    // ── 8. Control socket — bidirectional: inbound ControlMessages from the
+    // shell, outbound ShellEvents (HUD activity stream) to connected clients. ──
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(64);
     let (surface_tx, mut surface_rx) = mpsc::channel::<SurfaceSignal>(256);
+    // Pre-serialized ShellEvent JSON lines fan out to every connected shell.
+    let (shell_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
     // Surface signal drain (log them for now; wm will read over IPC)
     tokio::spawn(async move {
@@ -311,12 +457,28 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Catalog refresh: when an artifact registers/unregisters after a shell is
+    // already connected, re-broadcast the command palette + launcher app grid so
+    // late-loading apps appear without a reconnect.
+    {
+        let events      = shell_tx.clone();
+        let hub_refresh = hub.clone();
+        tokio::spawn(async move {
+            while catalog_rx.recv().await.is_ok() {
+                let _ = events.send(commands_available_line(&hub_refresh));
+                let _ = events.send(apps_available_line(&hub_refresh));
+            }
+        });
+    }
+
     // Start control socket listener
     if !args.no_wm {
         let socket_path = cfg.sockets.control.clone();
         let ctrl_tx     = control_tx.clone();
+        let events      = shell_tx.clone();
+        let hub_ctl     = hub.clone();
         tokio::spawn(async move {
-            run_control_socket(socket_path, ctrl_tx).await;
+            run_control_socket(socket_path, ctrl_tx, events, hub_ctl).await;
         });
         info!(socket = %cfg.sockets.control, "control socket listener started");
     }
@@ -345,8 +507,23 @@ async fn main() -> anyhow::Result<()> {
     let session_id = session.id.clone();
     let agent_id   = session.agent_id.clone();
 
-    let (cap_surface_tx, _cap_surface_rx) = mpsc::channel::<SurfaceSignal>(64);
+    let (cap_surface_tx, mut cap_surface_rx) = mpsc::channel::<SurfaceSignal>(64);
     let gate = CapabilityGate::new(granted.clone(), cap_surface_tx);
+
+    // Forward agent surface signals (approvals/interrupts) into the shell event
+    // stream so the UI's approval banners + interrupt modals receive them. The
+    // HUD activity stream (thinking/tools/mode) comes from AgentEvents below;
+    // here we forward only the human-action signals AgentEvent lacks.
+    {
+        let events = shell_tx.clone();
+        tokio::spawn(async move {
+            while let Some(sig) = cap_surface_rx.recv().await {
+                if let Some(line) = surface_signal_line(&sig) {
+                    let _ = events.send(line);
+                }
+            }
+        });
+    }
 
     let harness_cfg = HarnessConfig {
         model:                      model.clone(),
@@ -372,9 +549,37 @@ async fn main() -> anyhow::Result<()> {
     // fleet relay (device → cloud → web) when fleet is enabled.
     let bus2 = bus.clone();
     let sid2  = session_id.clone();
+    let shell_events = shell_tx.clone();
+    let snap_fleet_url = cfg.fleet.cloud_url.clone();
+    let snap_flavor    = cfg.fleet.flavor.clone();
+    let snap_node_id   = node_id.clone();
     let (state_tx, state_rx) = mpsc::channel::<kiki_fleet::StatePatch>(128);
     tokio::spawn(async move {
         while let Some(event) = ev_rx.recv().await {
+            // A captured snapshot is uploaded to the snapshot store, not mirrored
+            // to the relay or the local bus (it's an internal fleet operation).
+            if let kiki_core::harness::AgentEvent::SnapshotCaptured { snapshot_id, bundle } = &event {
+                if fleet_enabled {
+                    let (url, flavor, nid) = (snap_fleet_url.clone(), snap_flavor.clone(), snap_node_id.clone());
+                    let (sid, b) = (snapshot_id.clone(), (**bundle).clone());
+                    tokio::spawn(async move {
+                        let mut client = kiki_fleet::FleetClient::new(&url, &nid)
+                            .with_identity(&flavor, env!("CARGO_PKG_VERSION"), None);
+                        let token = std::env::var("KIKI_FLEET_TOKEN").ok().filter(|t| !t.is_empty())
+                            .or_else(|| kiki_fleet::TokenStore::new("/var/kiki/state/fleet-token").load());
+                        if let Some(t) = token { client = client.with_token(t); }
+                        match client.upload_snapshot(&sid, &b).await {
+                            Ok(())  => info!(snapshot = %sid, "fleet: snapshot uploaded"),
+                            Err(e)  => warn!(snapshot = %sid, error = %e, "fleet: snapshot upload failed"),
+                        }
+                    });
+                }
+                continue;
+            }
+            // Fan the event out to connected shell clients (HUD activity stream).
+            if let Some(line) = shell_event_line(&event) {
+                let _ = shell_events.send(line);
+            }
             if fleet_enabled {
                 // Lossy on purpose: if the relay isn't draining we drop mirror
                 // updates rather than stalling the agent loop.
@@ -408,47 +613,99 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── 10. Run the harness ──────────────────────────���─────────────────────────
-    info!(session = %session_id, "harness starting");
+    // agentd is a long-lived daemon: it keeps serving the MCP hub, control
+    // socket, and fleet relay for the whole machine session, independent of any
+    // single agent session. The foreground session therefore runs in its own
+    // task — when it completes, fails, or has no model yet, the daemon stays up
+    // ready for the next one (started on demand via the control socket / fleet).
+    info!(session = %session_id, "foreground session starting");
     scheduler.add(session.clone(), SessionPriority::Foreground, None);
     scheduler.set_foreground(&session_id);
 
-    let outcome = harness.run().await;
+    {
+        let node_id = node_id.clone();
+        tokio::spawn(async move {
+            let outcome = harness.run().await;
 
-    // Frozen for cloud migration? Build the bundle from the (now-frozen) context
-    // and relay it to the target node, where a cloud agentd resumes it. (The
-    // harness can't send it itself — kiki-core doesn't depend on kiki-fleet.)
-    if let Some(target) = harness.pending_migration.clone() {
-        info!(session = %session_id, target = %target, "migrating session to cloud");
-        match send_migration_to(&target, &harness.ctx, &cfg, &node_id).await {
-            Ok(())  => {
-                session.complete_migration(&target);
-                info!(session = %session_id, target = %target, "session migrated");
+            // Frozen for cloud migration? Build the bundle from the (now-frozen)
+            // context and relay it to the target node, where a cloud agentd
+            // resumes it. (The harness can't send it itself — kiki-core doesn't
+            // depend on kiki-fleet.)
+            if let Some(target) = harness.pending_migration.clone() {
+                info!(session = %session_id, target = %target, "migrating session to cloud");
+                match send_migration_to(&target, &harness.ctx, &cfg, &node_id).await {
+                    Ok(())  => {
+                        session.complete_migration(&target);
+                        info!(session = %session_id, target = %target, "session migrated");
+                    }
+                    Err(e) => {
+                        error!(session = %session_id, error = %e, "migration send failed");
+                        session.fail(format!("migration failed: {e}"));
+                    }
+                }
+                return;
             }
-            Err(e) => {
-                error!(session = %session_id, error = %e, "migration send failed");
-                session.fail(format!("migration failed: {e}"));
+
+            match outcome {
+                Ok(outcome) => {
+                    let messages = harness.ctx.messages.clone();
+                    info!(session = %session_id, ?outcome, "session complete");
+                    session.complete();
+                    dreamer.spawn(session_id.clone(), agent_id, messages, state);
+                }
+                Err(e) => {
+                    error!(session = %session_id, error = %e, "session failed");
+                    session.fail(e.to_string());
+                }
             }
-        }
-        return Ok(());
+        });
     }
 
-    match outcome {
-        Ok(outcome) => {
-            let messages = harness.ctx.messages.clone();
-            info!(session = %session_id, ?outcome, "session complete");
-            session.complete();
-            dreamer.spawn(session_id.clone(), agent_id, messages, state);
-        }
-        Err(e) => {
-            error!(session = %session_id, error = %e, "session failed");
-            session.fail(e.to_string());
-        }
-    }
-
+    // ── 11. Stay alive until the OS stops us ──────────────────────────────────
+    // Block on SIGTERM (systemd stop) / SIGINT so the daemon keeps serving the
+    // MCP hub, control socket, and fleet relay until the machine shuts it down.
+    wait_for_shutdown().await;
+    info!("agentd received shutdown signal — exiting");
     Ok(())
 }
 
 // ── Default agent config ──────────────────────────────────────────────────────
+
+/// Load the node's granted capability set from the policy file written by the
+/// package manager (kpkg) when an artifact's capabilities are approved. Supports
+/// per-artifact grants and the legacy flat `{ "granted": [...] }` shape (see
+/// [`kiki_core::NodePolicy`]). Absent → empty set (deny-by-default); malformed →
+/// empty set with a warning.
+fn load_granted_caps(path: &str) -> CapabilitySet {
+    match kiki_core::NodePolicy::load(path) {
+        Ok(policy) => {
+            info!(path, granted = policy.grant_count(), "loaded node capability policy");
+            policy.to_capability_set()
+        }
+        Err(e) => {
+            warn!(path, error = %e, "invalid policy file — using empty capability set");
+            CapabilitySet::new()
+        }
+    }
+}
+
+/// Block until the process receives a termination signal (SIGTERM from a systemd
+/// `stop`, or SIGINT from a terminal). Keeps agentd running as a daemon.
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s)  => s,
+        Err(e) => { error!(error = %e, "failed to install SIGTERM handler"); return; }
+    };
+    let mut intr = match signal(SignalKind::interrupt()) {
+        Ok(s)  => s,
+        Err(e) => { error!(error = %e, "failed to install SIGINT handler"); return; }
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = intr.recv() => {}
+    }
+}
 
 struct KikiAssistantAgent { agent_id: String }
 
@@ -467,9 +724,14 @@ impl AgentConfig for KikiAssistantAgent {
 
 // ── Control socket listener ─────────────────��─────────────────────────────────
 
-async fn run_control_socket(path: String, tx: mpsc::Sender<ControlMessage>) {
+async fn run_control_socket(
+    path:   String,
+    tx:     mpsc::Sender<ControlMessage>,
+    events: tokio::sync::broadcast::Sender<String>,
+    hub:    Arc<McpHub>,
+) {
     use tokio::{
-        io::{AsyncBufReadExt, BufReader},
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixListener,
     };
 
@@ -486,8 +748,27 @@ async fn run_control_socket(path: String, tx: mpsc::Sender<ControlMessage>) {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let tx2 = tx.clone();
+                let mut ev_rx = events.subscribe();
+                // Snapshot the current command catalog + installed apps for this shell.
+                let commands_line = commands_available_line(&hub);
+                let apps_line     = apps_available_line(&hub);
                 tokio::spawn(async move {
-                    let (read, _write) = tokio::io::split(stream);
+                    let (read, mut write) = tokio::io::split(stream);
+                    // Outbound: send the command catalog + app grid, then stream events.
+                    tokio::spawn(async move {
+                        let _ = write.write_all(commands_line.as_bytes()).await;
+                        let _ = write.write_all(b"\n").await;
+                        let _ = write.write_all(apps_line.as_bytes()).await;
+                        let _ = write.write_all(b"\n").await;
+                        while let Ok(line) = ev_rx.recv().await {
+                            if write.write_all(line.as_bytes()).await.is_err()
+                                || write.write_all(b"\n").await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                    // Inbound: parse ControlMessages from the client.
                     let mut lines = BufReader::new(read).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         match serde_json::from_str::<ControlMessage>(&line) {
@@ -499,6 +780,119 @@ async fn run_control_socket(path: String, tx: mpsc::Sender<ControlMessage>) {
             }
             Err(e) => { error!(error = %e, "control socket accept error"); break; }
         }
+    }
+}
+
+/// Map an [`AgentEvent`] to a ShellEvent JSON line for the shell HUD stream.
+/// The wire format must match `kiki_shell_core::ShellEvent` (the WM repo mirrors
+/// this protocol; the two repos share no code). Returns None for events the
+/// shell doesn't render.
+fn shell_event_line(event: &kiki_core::harness::AgentEvent) -> Option<String> {
+    use kiki_core::harness::AgentEvent;
+    let v = match event {
+        AgentEvent::Thinking { text } => serde_json::json!({"type":"thinking","text":text}),
+        AgentEvent::Content { text } => serde_json::json!({"type":"content","text":text}),
+        // AgentEvent has no per-call id; the tool name correlates start/complete.
+        AgentEvent::ToolStart { name, .. } => {
+            serde_json::json!({"type":"tool_start","id":name,"name":name})
+        }
+        AgentEvent::ToolComplete { name, success } => {
+            serde_json::json!({"type":"tool_complete","id":name,"name":name,"success":success})
+        }
+        AgentEvent::ModeChange { mode } => {
+            serde_json::json!({"type":"mode_changed","mode":control_mode_wire(mode)})
+        }
+        AgentEvent::Done { session_id, .. } => {
+            serde_json::json!({"type":"session_done","id":session_id})
+        }
+        AgentEvent::TokenUsage { used, limit } => {
+            serde_json::json!({"type":"token_usage","used":used,"limit":limit})
+        }
+        AgentEvent::Error { error } => serde_json::json!({"type":"error","message":error}),
+        _ => return None,
+    };
+    Some(v.to_string())
+}
+
+/// Map an agent [`SurfaceSignal`] to a ShellEvent JSON line. Only the
+/// human-action signals (approvals/interrupts) are forwarded here; the HUD
+/// activity stream comes from AgentEvents. Wire must match `ShellEvent`.
+fn surface_signal_line(sig: &SurfaceSignal) -> Option<String> {
+    let v = match sig {
+        SurfaceSignal::ApprovalRequired { request_id, tool_name, description, .. } => {
+            serde_json::json!({
+                "type": "interrupt",
+                "id": request_id,
+                "kind": "confirmation",
+                "message": format!("{tool_name}: {description}"),
+            })
+        }
+        SurfaceSignal::Interrupt { interrupt_id, kind, message, .. } => {
+            serde_json::json!({
+                "type": "interrupt",
+                "id": interrupt_id,
+                "kind": interrupt_kind_wire(kind),
+                "message": message,
+            })
+        }
+        _ => return None,
+    };
+    Some(v.to_string())
+}
+
+/// kiki-core InterruptKind → the snake_case wire string the shell expects.
+fn interrupt_kind_wire(kind: &kiki_core::interrupt::InterruptKind) -> &'static str {
+    use kiki_core::interrupt::InterruptKind;
+    match kind {
+        InterruptKind::DecisionRequired => "decision_required",
+        InterruptKind::Confirmation => "confirmation",
+        InterruptKind::Attention => "attention",
+        InterruptKind::Info => "info",
+    }
+}
+
+/// Build a `commands_available` ShellEvent line from the hub's registered tools.
+fn commands_available_line(hub: &McpHub) -> String {
+    let commands: Vec<serde_json::Value> = hub
+        .all_tools()
+        .into_iter()
+        .map(|t| {
+            serde_json::json!({
+                "id": t.name,
+                "title": t.name,
+                "description": t.description,
+                "category": "tool",
+            })
+        })
+        .collect();
+    serde_json::json!({ "type": "commands_available", "commands": commands }).to_string()
+}
+
+/// Build an `apps_available` ShellEvent line from the hub's registered artifacts.
+/// Drives the launcher app grid. Wire must match `kiki_shell_core::ShellEvent`.
+fn apps_available_line(hub: &McpHub) -> String {
+    let apps: Vec<serde_json::Value> = hub
+        .installed_apps()
+        .into_iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.artifact_id,
+                "name": a.artifact_id,
+                "version": a.version,
+                "tools": a.tools,
+            })
+        })
+        .collect();
+    serde_json::json!({ "type": "apps_available", "apps": apps }).to_string()
+}
+
+/// ControlMode → the snake_case wire string the shell expects.
+fn control_mode_wire(mode: &ControlMode) -> &'static str {
+    match mode {
+        ControlMode::BypassPermissions => "bypass_permissions",
+        ControlMode::AgentMode => "agent_mode",
+        ControlMode::AssistedMode => "assisted_mode",
+        ControlMode::HumanMode => "human_mode",
     }
 }
 
@@ -526,7 +920,7 @@ fn now_ms() -> u64 {
 fn fresh_session(
     session_id: &str,
     mode:       ControlMode,
-    state:      Arc<MemoryBackend>,
+    state:      Arc<dyn kiki_core::state::StateBackend>,
 ) -> (Arc<AgentSession>, Context) {
     let agent_id = "kiki-assistant".to_string();
     let session  = Arc::new(AgentSession::new(
@@ -546,7 +940,7 @@ async fn resume_from_cloud(
     resume_id: &str,
     node_id:   &str,
     cfg:       &Config,
-    state:     Arc<MemoryBackend>,
+    state:     Arc<dyn kiki_core::state::StateBackend>,
 ) -> anyhow::Result<Option<(Arc<AgentSession>, Context)>> {
     let registry = std::env::var("KIKI_REGISTRY_URL")
         .unwrap_or_else(|_| "https://registry.kiki-os.com".into());
@@ -706,7 +1100,9 @@ fn event_to_patch(ev: &kiki_core::harness::AgentEvent) -> kiki_fleet::StatePatch
         E::Compacting { .. }        => serde_json::json!({ "kind": "compacting" }),
         E::Healing { attempt, .. }  => serde_json::json!({ "kind": "healing", "attempt": attempt }),
         E::Done { steps, .. }       => serde_json::json!({ "kind": "done", "steps": steps }),
+        E::TokenUsage { used, limit } => serde_json::json!({ "kind": "token_usage", "used": used, "limit": limit }),
         E::Error { error }          => serde_json::json!({ "kind": "error", "error": error }),
+        E::SnapshotCaptured { .. }  => serde_json::json!({ "kind": "snapshot_captured" }),
     };
     kiki_fleet::StatePatch::agent_status(status)
 }
@@ -784,7 +1180,7 @@ async fn spawn_fleet(setup: FleetSetup) {
 
     // ── SessionDO relay with reconnect. ────────────────────────────────────────
     loop {
-        let (publisher, mut inbound) = match kiki_fleet::connect_device(&fleet_url, &relay_session).await {
+        let (publisher, mut inbound) = match kiki_fleet::connect_device(&fleet_url, &relay_session, token.as_deref()).await {
             Ok(pair) => { info!(session = %relay_session, "fleet: session relay connected"); pair }
             Err(e) => {
                 warn!(error = %e, "fleet: session relay connect failed — retrying in 5s");
@@ -835,6 +1231,12 @@ async fn spawn_fleet(setup: FleetSetup) {
                             session_id:  session_id.clone(),
                             target_node: format!("cloud-{session_id}"),
                         }).await;
+                    }
+                    Some(kiki_fleet::DeviceInbound::CaptureSnapshot { snapshot_id }) => {
+                        // Capture a point-in-time bundle (no freeze); the harness
+                        // builds it and main's event drain uploads it.
+                        info!(snapshot = %snapshot_id, "fleet: capture-snapshot requested");
+                        let _ = ctrl_tx.send(ControlMessage::CaptureSnapshot { snapshot_id }).await;
                     }
                     None => break, // relay dropped → reconnect
                 },

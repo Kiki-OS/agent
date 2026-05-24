@@ -67,6 +67,10 @@ pub enum DeviceInbound {
     /// freezes it and sends its MigrationBundle to node `cloud-<session_id>`,
     /// where a CloudSessionDO-launched agentd resumes it.
     MigrateToCloud { session_id: String },
+    /// The cloud asked this node to capture a point-in-time snapshot of its
+    /// current session and upload it as fleet snapshot `snapshot_id` (used to
+    /// multiply / clone the node). The session is NOT frozen.
+    CaptureSnapshot { snapshot_id: String },
 }
 
 #[derive(Deserialize)]
@@ -78,6 +82,8 @@ enum InboundWire {
     InterruptResponse { interrupt_id: String, #[serde(default)] resolution: Value },
     #[serde(rename = "migrate_to_cloud")]
     MigrateToCloud { session_id: String },
+    #[serde(rename = "capture_snapshot")]
+    CaptureSnapshot { snapshot_id: String },
     #[serde(other)]
     Other,
 }
@@ -130,11 +136,17 @@ impl SessionPublisher {
 pub async fn connect_device(
     base_url:   &str,
     session_id: &str,
+    token:      Option<&str>,
 ) -> Result<(SessionPublisher, mpsc::Receiver<DeviceInbound>)> {
+    // Browsers/agents can't set Authorization on a WebSocket, so the bearer
+    // rides as `?token=` (the fleet worker normalizes it like /v1/realtime).
+    // Device tokens (`kiki_d_<hex>`) are URL-safe, so no escaping is needed.
+    let auth_qs = token.map(|t| format!("&token={t}")).unwrap_or_default();
     let ws_url = format!(
-        "{}/v1/fleet/sessions/{}/ws?role=device",
+        "{}/v1/fleet/sessions/{}/ws?role=device{}",
         base_url.replace("https://", "wss://").replace("http://", "ws://"),
         session_id,
+        auth_qs,
     );
 
     let (ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
@@ -172,6 +184,9 @@ pub async fn connect_device(
                         }
                         Ok(InboundWire::MigrateToCloud { session_id }) => {
                             if in_tx.send(DeviceInbound::MigrateToCloud { session_id }).await.is_err() { break; }
+                        }
+                        Ok(InboundWire::CaptureSnapshot { snapshot_id }) => {
+                            if in_tx.send(DeviceInbound::CaptureSnapshot { snapshot_id }).await.is_err() { break; }
                         }
                         Ok(InboundWire::Other) => {}
                         Err(e) => tracing::warn!(error = %e, "session ws parse"),
