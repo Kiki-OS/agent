@@ -12,7 +12,9 @@
 pub mod ostree;
 pub mod memory;
 pub mod hybrid;
+pub mod file;
 
 pub use ostree::OstreeBackend;
 pub use memory::MemoryBackend;
 pub use hybrid::HybridBackend;
+pub use file::FileBackend;

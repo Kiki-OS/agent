@@ -1,0 +1,21 @@
+[package]
+name        = "kiki-memory"
+description = "OS-level memory subsystem — four-layer durable store (episodic/semantic/procedural/identity) + query API for memoryd"
+edition.workspace = true
+workspace   = "./../.."
+
+[features]
+# The async socket client (agentd uses it). Off by default so the pure core
+# stays tokio-free.
+client = ["dep:tokio"]
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tokio       = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { workspace = true }

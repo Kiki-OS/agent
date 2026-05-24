@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "agentd",
+    "memoryd",
     "crates/kiki-core",
     "crates/kiki-mcp",
     "crates/kiki-provider",
@@ -12,6 +13,10 @@ members = [
     "crates/kiki-telemetry",
     "crates/kiki-config",
     "crates/kiki-vault",
+    "crates/kiki-pkg",
+    "crates/kiki-net",
+    "crates/kiki-oauth",
+    "crates/kiki-memory",
 ]
 
 [workspace.package]
@@ -55,6 +60,10 @@ kiki-fleet       = { path = "crates/kiki-fleet" }
 kiki-telemetry   = { path = "crates/kiki-telemetry" }
 kiki-config      = { path = "crates/kiki-config" }
 kiki-vault       = { path = "crates/kiki-vault" }
+kiki-pkg         = { path = "crates/kiki-pkg" }
+kiki-net         = { path = "crates/kiki-net" }
+kiki-oauth       = { path = "crates/kiki-oauth" }
+kiki-memory      = { path = "crates/kiki-memory" }
 
 [profile.release]
 lto           = true
