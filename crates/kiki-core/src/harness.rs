@@ -129,7 +129,12 @@ pub enum AgentEvent {
     Compacting   { dropped_turns: usize },
     Healing      { attempt: usize, error: String },
     Done         { session_id: String, steps: u32 },
+    /// Context-window token usage after a turn (drives the HUD token meter).
+    TokenUsage   { used: u64, limit: u64 },
     Error        { error: String },
+    /// A point-in-time snapshot was captured for fleet `snapshot_id`. agentd
+    /// uploads `bundle` to the snapshot store (kiki-core can't reach the relay).
+    SnapshotCaptured { snapshot_id: String, bundle: Box<crate::state::MigrationBundle> },
 }
 
 // ─── Harness ──────────────────────────────────────────────────────────────────
@@ -147,6 +152,11 @@ pub struct Harness {
     surface_tx:  mpsc::Sender<SurfaceSignal>,
     control_rx:  mpsc::Receiver<ControlMessage>,
     event_tx:    Option<mpsc::Sender<AgentEvent>>,
+
+    /// On-device memory source (memoryd, via agentd). When set, the harness folds
+    /// session-relevant memory into the system prompt on the first user input.
+    memory:          Option<Arc<dyn crate::memory::MemoryContext>>,
+    memory_injected: bool,
 
     /// Set when a MigrateSession control message is handled: the target node the
     /// frozen session's MigrationBundle should go to. The orchestrator (agentd
@@ -169,12 +179,20 @@ impl Harness {
         Self {
             agent, ctx, config, provider, tools, gate,
             perceptors: vec![], surface_tx, control_rx, event_tx: None,
+            memory: None, memory_injected: false,
             pending_migration: None,
         }
     }
 
     pub fn with_event_channel(mut self, tx: mpsc::Sender<AgentEvent>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Attach an on-device memory source. The harness recalls memory relevant to
+    /// the first user input and folds it into the system prompt.
+    pub fn with_memory(mut self, memory: Arc<dyn crate::memory::MemoryContext>) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -441,7 +459,9 @@ impl Harness {
                 self.emit(AgentEvent::Compacting { dropped_turns: dropped });
             }
         }
+        let used = mgr.token_count() as u64;
         self.ctx.messages = mgr.messages();
+        self.emit(AgentEvent::TokenUsage { used, limit: self.config.context_window as u64 });
     }
 
     // ── Perception ────────────────────────────────────────────────────────────
@@ -488,6 +508,19 @@ impl Harness {
     async fn handle_control(&mut self, msg: ControlMessage) -> Result<LoopControl> {
         match msg {
             ControlMessage::UserInput { text } => {
+                // Fold on-device memory relevant to this request into the system
+                // prompt, once per session (identity + recalled procedural/episodic
+                // + standing corrections). Best-effort: recall failures are silent.
+                if !self.memory_injected {
+                    self.memory_injected = true;
+                    if let Some(mem) = self.memory.clone() {
+                        let lines = mem.recall(&text).await;
+                        if let Some(preamble) = crate::memory::memory_preamble(&lines) {
+                            let base = self.agent.system_prompt(&self.ctx);
+                            self.ctx.set_system_prompt(format!("{base}\n\n{preamble}"));
+                        }
+                    }
+                }
                 self.ctx.push_user_text(text);
                 Ok(LoopControl::Continue)
             }
@@ -510,6 +543,31 @@ impl Harness {
                 self.checkpoint("migrate").await.ok();
                 self.pending_migration = Some(target_node);
                 Ok(LoopControl::Freeze)
+            }
+            ControlMessage::CaptureSnapshot { snapshot_id } => {
+                // Point-in-time capture; the session keeps running. Build the
+                // bundle here (we own ctx + the state backend) and hand it to
+                // agentd via an event — kiki-core can't reach the relay itself.
+                self.checkpoint("snapshot").await.ok();
+                let runtime = crate::state::RuntimeSnapshot {
+                    agent_id:        self.ctx.agent_id.clone(),
+                    session_id:      self.ctx.session_id.clone(),
+                    step:            self.ctx.steps_taken() as u64,
+                    messages:        self.ctx.messages.clone(),
+                    interrupt_queue: self.ctx.interrupt_log.clone(),
+                    control_mode:    self.ctx.control_mode,
+                    session_label:   self.ctx.label.clone(),
+                    scenario:        self.ctx.scenario.clone(),
+                    layout:          self.ctx.layout,
+                    active_apps:     self.ctx.active_apps.clone(),
+                };
+                match self.ctx.state.snapshot(runtime).await {
+                    Ok(bundle) => self.emit(AgentEvent::SnapshotCaptured {
+                        snapshot_id, bundle: Box::new(bundle),
+                    }),
+                    Err(e) => self.emit(AgentEvent::Error { error: format!("snapshot: {e}") }),
+                }
+                Ok(LoopControl::Continue)
             }
         }
     }
@@ -604,5 +662,110 @@ fn conversation_to_provider(msg: &ConversationMessage) -> Option<ProviderMessage
             if blocks.is_empty() { return None; }
             Some(ProviderMessage { role: crate::provider::Role::Tool, content: blocks })
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_injection_tests {
+    use super::*;
+    use crate::capability::CapabilitySet;
+    use crate::context::{Context, ControlMode};
+    use crate::gate::CapabilityGate;
+    use crate::memory::MemoryContext;
+    use crate::provider::{CompletionRequest, CompletionStream, LlmProvider, StreamChunk};
+    use crate::state::{MigrationBundle, RuntimeSnapshot, StateBackend};
+    use crate::types::ControlMessage;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    /// Trivial state backend — the harness's `checkpoint` swallows errors (`.ok()`),
+    /// and this test path never snapshots/migrates.
+    struct NoopState;
+    #[async_trait]
+    impl StateBackend for NoopState {
+        async fn get(&self, _k: &str) -> Result<Option<Value>> { Ok(None) }
+        async fn set(&self, _k: &str, _v: Value) -> Result<()> { Ok(()) }
+        async fn commit(&self, _m: &str) -> Result<String> { Ok("noop".into()) }
+        async fn snapshot(&self, _r: RuntimeSnapshot) -> Result<MigrationBundle> {
+            Err(crate::error::Error::Io("unused".into()))
+        }
+        async fn restore(&self, _b: MigrationBundle) -> Result<()> { Ok(()) }
+        async fn push(&self, _r: &str) -> Result<String> { Ok("noop".into()) }
+        async fn pull(&self, _r: &str, _h: &str) -> Result<()> { Ok(()) }
+    }
+
+    /// Records the `system` field of the request it receives, then ends the turn
+    /// with no tool calls (→ session completes).
+    struct CapturingProvider {
+        seen_system: Arc<Mutex<Option<String>>>,
+    }
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        fn name(&self) -> &str { "capturing" }
+        fn supports_model(&self, _m: &str) -> bool { true }
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionStream> {
+            *self.seen_system.lock().unwrap() = request.system.clone();
+            let chunks: Vec<Result<StreamChunk>> =
+                vec![Ok(StreamChunk::Text("done".into())), Ok(StreamChunk::Done)];
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    struct FixedMemory;
+    #[async_trait]
+    impl MemoryContext for FixedMemory {
+        async fn recall(&self, _hint: &str) -> Vec<String> {
+            vec!["correction: be concise".into(), "Procedural: retry on network failure".into()]
+        }
+    }
+
+    struct TestAgent;
+    impl AgentConfig for TestAgent {
+        fn id(&self) -> &str { "mem-test" }
+        fn system_prompt(&self, _ctx: &Context) -> String { "BASE PROMPT".into() }
+    }
+
+    #[tokio::test]
+    async fn recalled_memory_is_folded_into_the_system_prompt() {
+        let seen_system = Arc::new(Mutex::new(None));
+        let provider = Arc::new(CapturingProvider { seen_system: seen_system.clone() });
+
+        let (surface_tx, mut surface_rx) = mpsc::channel(16);
+        tokio::spawn(async move { while surface_rx.recv().await.is_some() {} });
+        let (cap_tx, _cap_rx) = mpsc::channel(8);
+        let gate = CapabilityGate::new(CapabilitySet::new(), cap_tx);
+
+        let (control_tx, control_rx) = mpsc::channel(8);
+
+        let mut ctx = Context::new("mem-test", "session-mem", Arc::new(NoopState));
+        ctx.set_mode(ControlMode::AgentMode);
+        ctx.max_steps = Some(4);
+
+        let mut harness = Harness::new(
+            Arc::new(TestAgent),
+            ctx,
+            HarnessConfig { model: "test".into(), temperature: Some(0.0), ..Default::default() },
+            provider,
+            Arc::new(ToolRegistry::new()),
+            gate,
+            surface_tx,
+            control_rx,
+        )
+        .with_memory(Arc::new(FixedMemory));
+
+        control_tx
+            .send(ControlMessage::UserInput { text: "deploy the thing".into() })
+            .await
+            .unwrap();
+
+        let outcome = harness.run().await.expect("run");
+        assert_eq!(outcome, HarnessOutcome::Complete);
+
+        let system = seen_system.lock().unwrap().clone().expect("provider saw a system prompt");
+        assert!(system.contains("BASE PROMPT"), "base prompt preserved");
+        assert!(system.contains("Relevant memory"), "memory preamble injected: {system}");
+        assert!(system.contains("be concise"), "correction recalled into prompt");
+        assert!(system.contains("retry on network failure"), "procedural recalled into prompt");
     }
 }

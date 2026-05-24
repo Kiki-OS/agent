@@ -11,12 +11,17 @@ path = "src/main.rs"
 [dependencies]
 kiki-core        = { workspace = true }
 kiki-mcp         = { workspace = true }
+kiki-net         = { workspace = true }
+kiki-oauth       = { workspace = true }
+kiki-config      = { workspace = true }
+rand             = "0.8"
 kiki-provider    = { workspace = true }
 kiki-sandbox     = { workspace = true }
 kiki-state       = { workspace = true }
 kiki-orchestrator = { workspace = true }
 kiki-fleet       = { workspace = true }
 kiki-telemetry   = { workspace = true }
+kiki-memory      = { workspace = true, features = ["client"] }
 tokio            = { workspace = true }
 tracing          = { workspace = true }
 serde            = { workspace = true }

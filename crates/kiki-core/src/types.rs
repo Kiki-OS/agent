@@ -155,6 +155,10 @@ pub enum ControlMessage {
 
     /// Migrate session to target node.
     MigrateSession { session_id: String, target_node: String },
+
+    /// Capture a point-in-time snapshot of the current session and upload it as
+    /// fleet snapshot `snapshot_id` (for multiply / clone). Does not freeze.
+    CaptureSnapshot { snapshot_id: String },
 }
 
 /// User's response to an in-context approval dialog.

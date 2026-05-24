@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use clap::Parser;
 use kiki_telemetry::init as init_telemetry;
+
+mod memory_ctx;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -543,7 +545,9 @@ async fn main() -> anyhow::Result<()> {
         gate,
         surface_tx.clone(),
         control_rx,
-    ).with_event_channel(ev_tx);
+    )
+    .with_event_channel(ev_tx)
+    .with_memory(Arc::new(memory_ctx::MemorydContext::new()));
 
     // Relay AgentEvents to the event bus, and tee a compact state mirror to the
     // fleet relay (device → cloud → web) when fleet is enabled.
@@ -575,6 +579,17 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 continue;
+            }
+            // Post-task reflection: record session completion, errors, and healed
+            // failures as episodic memory. Best-effort — if memoryd isn't running,
+            // skip silently. (The event still flows to the shell + bus below.)
+            if let Some(write) = memory_ctx::reflection_write(&event, &sid2, now_ms()) {
+                tokio::spawn(async move {
+                    let client = kiki_memory::MemoryClient::default_socket();
+                    if let Err(e) = client.write(write).await {
+                        tracing::debug!(error = %e, "memoryd reflection write skipped");
+                    }
+                });
             }
             // Fan the event out to connected shell clients (HUD activity stream).
             if let Some(line) = shell_event_line(&event) {
@@ -772,7 +787,25 @@ async fn run_control_socket(
                     let mut lines = BufReader::new(read).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         match serde_json::from_str::<ControlMessage>(&line) {
-                            Ok(msg) => { let _ = tx2.send(msg).await; }
+                            Ok(msg) => {
+                                // Persist user corrections to memory immediately
+                                // (best-effort), before forwarding to the harness.
+                                if let ControlMessage::UserInput { text } = &msg {
+                                    if let Some(correction) = memory_ctx::detect_correction(text) {
+                                        tokio::spawn(async move {
+                                            let client = kiki_memory::MemoryClient::default_socket();
+                                            let _ = client
+                                                .write(kiki_memory::MemoryWrite::UserCorrection {
+                                                    correction,
+                                                    context: String::new(),
+                                                    ts_ms: now_ms(),
+                                                })
+                                                .await;
+                                        });
+                                    }
+                                }
+                                let _ = tx2.send(msg).await;
+                            }
                             Err(e)  => { warn!(error = %e, "invalid control message"); }
                         }
                     }

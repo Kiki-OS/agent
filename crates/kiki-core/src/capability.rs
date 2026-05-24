@@ -38,6 +38,45 @@ pub enum Capability {
     SecretsRead(String),
 }
 
+impl Capability {
+    /// Map an artifact's declared manifest capabilities (`kiki-schema`) onto the
+    /// OS capability tokens the gate + egress broker enforce. The single source
+    /// of this mapping — used by `kpkg` (to write grants) and the plugin loader
+    /// (to validate against the node's granted set), so they can't drift.
+    ///
+    /// Coarse where the OS token is coarse: any declared `network` entry maps to
+    /// `NetworkOutbound` (the per-host allowlist is enforced separately by the
+    /// egress broker from the same `network` list).
+    pub fn from_manifest(cs: &kiki_schema::CapabilitySet) -> Vec<Capability> {
+        let mut caps = Vec::new();
+        for p in &cs.fs_read {
+            caps.push(Capability::FsRead(p.clone()));
+        }
+        for p in &cs.fs_write {
+            caps.push(Capability::FsWrite(p.clone()));
+        }
+        if !cs.network.is_empty() {
+            caps.push(Capability::NetworkOutbound);
+        }
+        if !cs.exec.is_empty() {
+            caps.push(Capability::ProcessSpawn);
+        }
+        if cs.mcp_spawn {
+            caps.push(Capability::AgentSpawn);
+        }
+        if cs.display {
+            caps.push(Capability::WaylandSurface);
+        }
+        if cs.audio_in {
+            caps.push(Capability::AudioInput);
+        }
+        for p in &cs.vault.read {
+            caps.push(Capability::SecretsRead(p.clone()));
+        }
+        caps
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CapabilitySet(HashSet<Capability>);
 

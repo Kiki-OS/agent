@@ -6,10 +6,20 @@ workspace   = "./../.."
 
 [dependencies]
 kiki-core   = { workspace = true }
+kiki-schema = { path = "../../../kiki-sdk/crates/kiki-schema" }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
-nix         = { version = "0.29", features = ["process", "signal", "mount", "user"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix         = { version = "0.29", features = ["process", "signal", "mount", "user", "sched"] }
+libc        = "0.2"
+# Landlock filesystem LSM (kernel >= 5.13). Linux-only; enforcement is validated
+# on a real kernel (Fedora VM), not on this darwin dev host.
+landlock    = "0.4"
+# seccomp-bpf syscall filtering (pure-Rust, from the Firecracker project — no
+# system libseccomp dependency).
+seccompiler = "0.5"
