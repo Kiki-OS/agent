@@ -290,6 +290,16 @@ async fn main() -> anyhow::Result<()> {
     // (device → web).
     let fleet_enabled = !args.no_fleet && cfg.fleet.enabled && !cfg.fleet.cloud_url.is_empty();
 
+    // Cloud session container: when KIKI_RESUME_SESSION is set we resume a
+    // session migrated from a device instead of spinning up a fresh one. The
+    // node id is derived from the session so the source can address the
+    // migration bundle to us and our poll finds it.
+    let resume_session = std::env::var("KIKI_RESUME_SESSION").ok().filter(|s| !s.is_empty());
+    let node_id = match &resume_session {
+        Some(s) => format!("cloud-{s}"),
+        None    => derive_node_id(),
+    };
+
     // ── 8. Control socket — listen for compositor + remote control messages ───
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(64);
     let (surface_tx, mut surface_rx) = mpsc::channel::<SurfaceSignal>(256);
@@ -311,24 +321,29 @@ async fn main() -> anyhow::Result<()> {
         info!(socket = %cfg.sockets.control, "control socket listener started");
     }
 
-    // ── 9. Spin up the default agent session ──────────────────────────────────
-    let session_id = format!("session-{}", now_ms());
-    let agent_id   = "kiki-assistant".to_string();
-
-    let session = Arc::new(AgentSession::new(
-        session_id.clone(),
-        "Kiki OS Assistant",
-        agent_id.clone(),
-        state.clone(),
-    ));
-    sessions.add(session.clone());
-
-    let ctx = {
-        let mut c = Context::new(agent_id.clone(), session_id.clone(), state.clone());
-        c.set_mode(control_mode);
-        c.max_steps = None; // no step limit
-        c
+    // ── 9. Session: resume a migrated one (cloud), or spin up a fresh default ──
+    let (session, ctx) = match &resume_session {
+        Some(id) if fleet_enabled => {
+            match resume_from_cloud(id, &node_id, &cfg, state.clone()).await {
+                Ok(Some(pair)) => {
+                    info!(session = %id, "resumed migrated session from bundle");
+                    pair
+                }
+                Ok(None) => {
+                    warn!(session = %id, "no migration bundle arrived — starting fresh");
+                    fresh_session(id, control_mode, state.clone())
+                }
+                Err(e) => {
+                    warn!(session = %id, error = %e, "resume failed — starting fresh");
+                    fresh_session(id, control_mode, state.clone())
+                }
+            }
+        }
+        _ => fresh_session(&format!("session-{}", now_ms()), control_mode, state.clone()),
     };
+    sessions.add(session.clone());
+    let session_id = session.id.clone();
+    let agent_id   = session.agent_id.clone();
 
     let (cap_surface_tx, _cap_surface_rx) = mpsc::channel::<SurfaceSignal>(64);
     let gate = CapabilityGate::new(granted.clone(), cap_surface_tx);
@@ -376,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
         let flavor    = cfg.fleet.flavor.clone();
         let os_version = env!("CARGO_PKG_VERSION").to_string();
         let hb_secs   = cfg.fleet.heartbeat_interval;
-        let node_id   = derive_node_id();
+        let node_id   = node_id.clone();
         let relay_session = node_id.clone(); // one session per node (web connects here)
         let token_store = kiki_fleet::TokenStore::new("/var/kiki/state/fleet-token");
         let ctrl_tx   = control_tx.clone();
@@ -483,6 +498,80 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ── Session helpers ─────────────────────────────────────────────────────────
+
+/// Build a fresh default session + context.
+fn fresh_session(
+    session_id: &str,
+    mode:       ControlMode,
+    state:      Arc<MemoryBackend>,
+) -> (Arc<AgentSession>, Context) {
+    let agent_id = "kiki-assistant".to_string();
+    let session  = Arc::new(AgentSession::new(
+        session_id, "Kiki OS Assistant", agent_id.clone(), state.clone(),
+    ));
+    let mut ctx = Context::new(agent_id, session_id, state);
+    ctx.set_mode(mode);
+    ctx.max_steps = None; // no step limit
+    (session, ctx)
+}
+
+/// Resume a session migrated to the cloud: poll the fleet relay for the bundle
+/// addressed to this node, pull + restore it, and reconstruct the session +
+/// context. Returns `Ok(None)` if no bundle arrives within the poll window (the
+/// caller then falls back to a fresh session).
+async fn resume_from_cloud(
+    resume_id: &str,
+    node_id:   &str,
+    cfg:       &Config,
+    state:     Arc<MemoryBackend>,
+) -> anyhow::Result<Option<(Arc<AgentSession>, Context)>> {
+    let registry = std::env::var("KIKI_REGISTRY_URL")
+        .unwrap_or_else(|_| "https://registry.kiki-os.com".into());
+
+    let mut client = kiki_fleet::FleetClient::new(&cfg.fleet.cloud_url, node_id)
+        .with_identity(&cfg.fleet.flavor, env!("CARGO_PKG_VERSION"), None);
+    if let Ok(t) = std::env::var("KIKI_FLEET_TOKEN") {
+        if !t.is_empty() { client = client.with_token(t); }
+    }
+    let client = Arc::new(client);
+    // Best-effort: announce this cloud node so the relay/dashboard can find it.
+    if let Err(e) = client.register_self().await {
+        warn!(error = %e, "cloud node registration failed (continuing)");
+    }
+
+    let receiver = kiki_fleet::MigrationReceiver::new(client, registry);
+
+    // The source pushes the bundle around the time we boot; poll briefly for it.
+    let mut bundle = None;
+    for _ in 0..30 {
+        match receiver.poll().await {
+            Ok(items) => {
+                if let Some((_, b)) = items.into_iter().find(|(sid, _)| sid == resume_id) {
+                    bundle = Some(b);
+                    break;
+                }
+            }
+            Err(e) => warn!(error = %e, "poll migrations failed; retrying"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let Some(bundle) = bundle else { return Ok(None) };
+
+    let restored = receiver
+        .restore(bundle, state.clone(), CapabilitySet::new())
+        .await
+        .map_err(|e| anyhow::anyhow!("restore failed: {e}"))?;
+
+    let session = Arc::new(AgentSession::new(
+        restored.bundle.session_id.clone(),
+        restored.bundle.runtime.session_label.clone(),
+        restored.bundle.runtime.agent_id.clone(),
+        state,
+    ));
+    Ok(Some((session, restored.ctx)))
 }
 
 // ── Fleet wiring ────────────────────────────────────────────────────────────
