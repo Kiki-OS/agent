@@ -147,6 +147,12 @@ pub struct Harness {
     surface_tx:  mpsc::Sender<SurfaceSignal>,
     control_rx:  mpsc::Receiver<ControlMessage>,
     event_tx:    Option<mpsc::Sender<AgentEvent>>,
+
+    /// Set when a MigrateSession control message is handled: the target node the
+    /// frozen session's MigrationBundle should go to. The orchestrator (agentd
+    /// main) reads this after `run()` returns `Frozen` and performs the send —
+    /// kiki-core can't depend on kiki-fleet, so the transport lives there.
+    pub pending_migration: Option<String>,
 }
 
 impl Harness {
@@ -163,6 +169,7 @@ impl Harness {
         Self {
             agent, ctx, config, provider, tools, gate,
             perceptors: vec![], surface_tx, control_rx, event_tx: None,
+            pending_migration: None,
         }
     }
 
@@ -294,14 +301,14 @@ impl Harness {
                         }
                     }
 
-                    // Hard-stop mid-stream (user pressed stop)
+                    // Control mid-stream: stop or freeze (park / migrate) end the turn.
                     ctrl = self.control_rx.recv() => {
-                        if let Some(ControlMessage::StopSession { .. }) = ctrl {
-                            drop(stream);
-                            return Ok(HarnessOutcome::Stopped);
-                        }
                         if let Some(msg) = ctrl {
-                            self.handle_control(msg).await.ok();
+                            match self.handle_control(msg).await {
+                                Ok(LoopControl::Stop)   => { drop(stream); return Ok(HarnessOutcome::Stopped); }
+                                Ok(LoopControl::Freeze) => { drop(stream); return Ok(HarnessOutcome::Frozen); }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -499,8 +506,9 @@ impl Harness {
                 self.checkpoint("park").await.ok();
                 Ok(LoopControl::Freeze)
             }
-            ControlMessage::MigrateSession { .. } => {
+            ControlMessage::MigrateSession { target_node, .. } => {
                 self.checkpoint("migrate").await.ok();
+                self.pending_migration = Some(target_node);
                 Ok(LoopControl::Freeze)
             }
         }

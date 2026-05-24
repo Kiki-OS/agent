@@ -63,6 +63,10 @@ pub enum DeviceInbound {
     ToolCall { request_id: String, tool: String, input: Value },
     /// A client answered an interrupt the device raised.
     InterruptResponse { interrupt_id: String, resolution: Value },
+    /// A client asked the device to move this session to the cloud. The device
+    /// freezes it and sends its MigrationBundle to node `cloud-<session_id>`,
+    /// where a CloudSessionDO-launched agentd resumes it.
+    MigrateToCloud { session_id: String },
 }
 
 #[derive(Deserialize)]
@@ -72,6 +76,8 @@ enum InboundWire {
     ToolCall { request_id: String, tool: String, #[serde(default)] input: Value },
     #[serde(rename = "interrupt_response")]
     InterruptResponse { interrupt_id: String, #[serde(default)] resolution: Value },
+    #[serde(rename = "migrate_to_cloud")]
+    MigrateToCloud { session_id: String },
     #[serde(other)]
     Other,
 }
@@ -163,6 +169,9 @@ pub async fn connect_device(
                         }
                         Ok(InboundWire::InterruptResponse { interrupt_id, resolution }) => {
                             if in_tx.send(DeviceInbound::InterruptResponse { interrupt_id, resolution }).await.is_err() { break; }
+                        }
+                        Ok(InboundWire::MigrateToCloud { session_id }) => {
+                            if in_tx.send(DeviceInbound::MigrateToCloud { session_id }).await.is_err() { break; }
                         }
                         Ok(InboundWire::Other) => {}
                         Err(e) => tracing::warn!(error = %e, "session ws parse"),

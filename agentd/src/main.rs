@@ -412,7 +412,27 @@ async fn main() -> anyhow::Result<()> {
     scheduler.add(session.clone(), SessionPriority::Foreground, None);
     scheduler.set_foreground(&session_id);
 
-    match harness.run().await {
+    let outcome = harness.run().await;
+
+    // Frozen for cloud migration? Build the bundle from the (now-frozen) context
+    // and relay it to the target node, where a cloud agentd resumes it. (The
+    // harness can't send it itself — kiki-core doesn't depend on kiki-fleet.)
+    if let Some(target) = harness.pending_migration.clone() {
+        info!(session = %session_id, target = %target, "migrating session to cloud");
+        match send_migration_to(&target, &harness.ctx, &cfg, &node_id).await {
+            Ok(())  => {
+                session.complete_migration(&target);
+                info!(session = %session_id, target = %target, "session migrated");
+            }
+            Err(e) => {
+                error!(session = %session_id, error = %e, "migration send failed");
+                session.fail(format!("migration failed: {e}"));
+            }
+        }
+        return Ok(());
+    }
+
+    match outcome {
         Ok(outcome) => {
             let messages = harness.ctx.messages.clone();
             info!(session = %session_id, ?outcome, "session complete");
@@ -572,6 +592,50 @@ async fn resume_from_cloud(
         state,
     ));
     Ok(Some((session, restored.ctx)))
+}
+
+/// Build a MigrationBundle from a frozen session's context and relay it to the
+/// target node (e.g. `cloud-<session>`). Lives here because kiki-core (the
+/// harness) can't depend on kiki-fleet — it signals intent via
+/// `Harness::pending_migration` and main performs the transport.
+async fn send_migration_to(
+    target:  &str,
+    ctx:     &Context,
+    cfg:     &Config,
+    node_id: &str,
+) -> anyhow::Result<()> {
+    use kiki_core::state::RuntimeSnapshot;
+
+    let registry = std::env::var("KIKI_REGISTRY_URL")
+        .unwrap_or_else(|_| "https://registry.kiki-os.com".into());
+
+    let runtime = RuntimeSnapshot {
+        agent_id:        ctx.agent_id.clone(),
+        session_id:      ctx.session_id.clone(),
+        step:            ctx.steps_taken() as u64,
+        messages:        ctx.messages.clone(),
+        interrupt_queue: ctx.interrupt_log.clone(),
+        control_mode:    ctx.control_mode,
+        session_label:   ctx.label.clone(),
+        scenario:        ctx.scenario.clone(),
+        layout:          ctx.layout,
+        active_apps:     ctx.active_apps.clone(),
+    };
+
+    let bundle = ctx.state.snapshot(runtime).await
+        .map_err(|e| anyhow::anyhow!("snapshot: {e}"))?;
+    ctx.state.push(&registry).await
+        .map_err(|e| anyhow::anyhow!("push: {e}"))?;
+
+    let mut client = kiki_fleet::FleetClient::new(&cfg.fleet.cloud_url, node_id)
+        .with_identity(&cfg.fleet.flavor, env!("CARGO_PKG_VERSION"), None);
+    let token = std::env::var("KIKI_FLEET_TOKEN").ok().filter(|t| !t.is_empty())
+        .or_else(|| kiki_fleet::TokenStore::new("/var/kiki/state/fleet-token").load());
+    if let Some(t) = token { client = client.with_token(t); }
+
+    client.send_migration(&ctx.session_id, &bundle, target).await
+        .map_err(|e| anyhow::anyhow!("send_migration: {e}"))?;
+    Ok(())
 }
 
 // ── Fleet wiring ────────────────────────────────────────────────────────────
@@ -761,6 +825,15 @@ async fn spawn_fleet(setup: FleetSetup) {
                         let _ = ctrl_tx.send(ControlMessage::ApprovalResponse {
                             request_id: interrupt_id,
                             decision:   approval_from_resolution(&resolution),
+                        }).await;
+                    }
+                    Some(kiki_fleet::DeviceInbound::MigrateToCloud { session_id }) => {
+                        // Freeze + ship this session to a cloud node; the harness
+                        // freezes and main's post-run step sends the bundle.
+                        info!(session = %session_id, "fleet: migrate-to-cloud requested");
+                        let _ = ctrl_tx.send(ControlMessage::MigrateSession {
+                            session_id:  session_id.clone(),
+                            target_node: format!("cloud-{session_id}"),
                         }).await;
                     }
                     None => break, // relay dropped → reconnect
