@@ -13,6 +13,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tokio::sync::broadcast;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -65,6 +66,15 @@ pub struct McpToolSpec {
     pub input_schema: Value,
 }
 
+/// Summary of one installed artifact, for the shell launcher's app grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledApp {
+    pub artifact_id: String,
+    pub version:     String,
+    /// Tool names this app exposes.
+    pub tools:       Vec<String>,
+}
+
 /// A tool call routed to a server.
 pub struct ToolCallRequest {
     pub tool_name: String,
@@ -76,23 +86,42 @@ pub struct ToolCallRequest {
 
 pub struct McpHub {
     servers: Arc<Mutex<HashMap<String, RegisteredServer>>>,
+    /// Fired whenever the set of registered servers changes, so the host can
+    /// re-push the command palette / launcher catalog to connected shells.
+    catalog_tx: Option<broadcast::Sender<()>>,
 }
 
 impl McpHub {
     pub fn new() -> Self {
-        Self { servers: Arc::new(Mutex::new(HashMap::new())) }
+        Self { servers: Arc::new(Mutex::new(HashMap::new())), catalog_tx: None }
+    }
+
+    /// Attach a notifier fired on every register/unregister. Receivers should
+    /// recompute and re-broadcast the catalog. Returns the receiver end.
+    pub fn with_catalog_notifier(mut self) -> (Self, broadcast::Receiver<()>) {
+        let (tx, rx) = broadcast::channel(16);
+        self.catalog_tx = Some(tx);
+        (self, rx)
+    }
+
+    fn notify_catalog_changed(&self) {
+        if let Some(tx) = &self.catalog_tx {
+            let _ = tx.send(());
+        }
     }
 
     /// Register a server (called when an artifact connects and declares its tools).
     pub fn register(&self, server: RegisteredServer) {
         info!(artifact = %server.artifact_id, tools = server.tools.len(), "MCP server registered");
         self.servers.lock().unwrap().insert(server.artifact_id.clone(), server);
+        self.notify_catalog_changed();
     }
 
     /// Unregister a server (called when an artifact disconnects).
     pub fn unregister(&self, artifact_id: &str) {
         warn!(artifact = %artifact_id, "MCP server unregistered");
         self.servers.lock().unwrap().remove(artifact_id);
+        self.notify_catalog_changed();
     }
 
     /// All tool specs from all registered servers.
@@ -100,6 +129,18 @@ impl McpHub {
         self.servers.lock().unwrap()
             .values()
             .flat_map(|s| s.tools.clone())
+            .collect()
+    }
+
+    /// One [`InstalledApp`] per registered artifact — for the launcher app grid.
+    pub fn installed_apps(&self) -> Vec<InstalledApp> {
+        self.servers.lock().unwrap()
+            .values()
+            .map(|s| InstalledApp {
+                artifact_id: s.artifact_id.clone(),
+                version:     s.version.clone(),
+                tools:       s.tools.iter().map(|t| t.name.clone()).collect(),
+            })
             .collect()
     }
 

@@ -18,6 +18,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use crate::hub::{McpHub, McpToolSpec, RegisteredServer, ToolCallRequest};
 use kiki_core::error::Result;
+use kiki_net::{EgressBroker, FetchRequest};
 
 const PROTOCOL_VERSION: &str = "0.1.0";
 const CHANNEL_CAP: usize = 32;
@@ -25,11 +26,21 @@ const CHANNEL_CAP: usize = 32;
 pub struct McpServer {
     hub:         Arc<McpHub>,
     socket_path: String,
+    /// Egress broker for the `net.fetch` tool apps invoke over their connection.
+    /// The calling app's identity is the connection's `artifactId` (handshake),
+    /// not a payload field — so an app can't borrow another's egress allowlist.
+    broker:      Option<Arc<EgressBroker>>,
 }
 
 impl McpServer {
     pub fn new(hub: Arc<McpHub>, socket_path: impl Into<String>) -> Self {
-        Self { hub, socket_path: socket_path.into() }
+        Self { hub, socket_path: socket_path.into(), broker: None }
+    }
+
+    /// Wire the egress broker so connected apps can call `net.fetch`.
+    pub fn with_broker(mut self, broker: Arc<EgressBroker>) -> Self {
+        self.broker = Some(broker);
+        self
     }
 
     /// Bind the socket and start accepting connections.
@@ -48,12 +59,14 @@ impl McpServer {
         info!(socket = %path, "MCP server listening");
 
         let hub = self.hub.clone();
+        let broker = self.broker.clone();
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let hub2 = hub.clone();
-                        tokio::spawn(handle_connection(stream, hub2));
+                        let broker2 = broker.clone();
+                        tokio::spawn(handle_connection(stream, hub2, broker2));
                     }
                     Err(e) => {
                         error!(error = %e, "MCP accept error");
@@ -67,7 +80,11 @@ impl McpServer {
     }
 }
 
-async fn handle_connection(stream: UnixStream, hub: Arc<McpHub>) {
+async fn handle_connection(
+    stream: UnixStream,
+    hub:    Arc<McpHub>,
+    broker: Option<Arc<EgressBroker>>,
+) {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
 
@@ -132,6 +149,11 @@ async fn handle_connection(stream: UnixStream, hub: Arc<McpHub>) {
 
     let mut req_id: u64 = 0;
 
+    // Outbound responses to app-initiated requests (e.g. net.fetch). A brokered
+    // fetch runs in its own task so a slow upstream doesn't stall the connection;
+    // it sends its JSON-RPC reply here and the loop serializes the socket write.
+    let (out_tx, mut out_rx) = mpsc::channel::<serde_json::Value>(CHANNEL_CAP);
+
     loop {
         tokio::select! {
             // Incoming call request from harness
@@ -153,14 +175,33 @@ async fn handle_connection(stream: UnixStream, hub: Arc<McpHub>) {
                 }
             }
 
-            // Incoming result/notification from artifact
+            // Outbound reply to an app-initiated request
+            out = out_rx.recv() => {
+                let Some(msg) = out else { continue; };
+                if let Err(e) = send_line(&mut write_half, &msg).await {
+                    error!(error = %e, "failed to send app response");
+                    break;
+                }
+            }
+
+            // Incoming line from artifact: either a RESULT to a harness call, or
+            // a REQUEST the app initiates (it has a `method`).
             line = lines.next_line() => {
                 match line {
                     Ok(Some(l)) => {
                         let Ok(msg): std::result::Result<serde_json::Value, _> = serde_json::from_str(&l) else { continue; };
+
+                        if let Some(method) = msg["method"].as_str() {
+                            // App → agentd request. Identity is the connection's
+                            // artifactId, not anything in the payload.
+                            handle_app_request(
+                                method, &msg, &art_id, broker.clone(), out_tx.clone(),
+                            );
+                            continue;
+                        }
+
                         let id_str = msg["id"].as_str().map(str::to_owned)
                             .or_else(|| msg["id"].as_u64().map(|n| n.to_string()));
-
                         if let Some(id_key) = id_str {
                             if let Some(tx) = pending.remove(&id_key) {
                                 if msg["error"].is_null() {
@@ -179,6 +220,55 @@ async fn handle_connection(stream: UnixStream, hub: Arc<McpHub>) {
     }
 
     hub.unregister(&art_id);
+}
+
+/// Handle an app-initiated JSON-RPC request. The only supported method today is
+/// `net.fetch` (brokered egress); the broker enforces the calling app's egress
+/// allowlist using `app_id` (the connection's artifactId — unspoofable here).
+/// Runs in its own task and replies via `out_tx`.
+fn handle_app_request(
+    method: &str,
+    msg:    &serde_json::Value,
+    app_id: &str,
+    broker: Option<Arc<EgressBroker>>,
+    out_tx: mpsc::Sender<serde_json::Value>,
+) {
+    let id = msg["id"].clone();
+    let app_id = app_id.to_string();
+    match method {
+        "net.fetch" => {
+            let params = msg["params"].clone();
+            tokio::spawn(async move {
+                let resp = match serde_json::from_value::<FetchRequest>(params) {
+                    Ok(req) => match broker {
+                        Some(b) => match b.fetch(&app_id, req).await {
+                            Ok(r) => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": { "status": r.status, "headers": r.headers, "body": r.body }
+                            }),
+                            Err(e) => err_response(id, -32000, &e.to_string()),
+                        },
+                        None => err_response(id, -32601, "net.fetch not available on this node"),
+                    },
+                    Err(e) => err_response(id, -32602, &format!("invalid params: {e}")),
+                };
+                let _ = out_tx.send(resp).await;
+            });
+        }
+        other => {
+            let resp = err_response(id, -32601, &format!("method not found: {other}"));
+            tokio::spawn(async move {
+                let _ = out_tx.send(resp).await;
+            });
+        }
+    }
+}
+
+fn err_response(id: serde_json::Value, code: i32, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id,
+        "error": { "code": code, "message": message }
+    })
 }
 
 async fn send_line<W: AsyncWriteExt + Unpin>(

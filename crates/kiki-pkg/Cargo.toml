@@ -1,0 +1,39 @@
+[package]
+name                   = "kiki-pkg"
+description            = "Kiki device-side artifact manager (kpkgd/kpkg) — install/verify/checkout registry artifacts into /var/kiki/apps"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[lib]
+name = "kiki_pkg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kpkg"
+path = "src/kpkg.rs"
+
+[dependencies]
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+anyhow     = { workspace = true }
+toml       = { workspace = true }
+clap       = { version = "4", features = ["derive", "env"] }
+kiki-core  = { workspace = true }
+kiki-memory = { workspace = true }
+# Registry client + manifest schema live in the kiki-sdk sibling workspace.
+kiki-registry-client = { path = "../../../kiki-sdk/crates/kiki-registry-client" }
+kiki-schema          = { path = "../../../kiki-sdk/crates/kiki-schema" }
+url        = "2"
+semver     = "1"
+# Bundle format: tar.zst.
+zstd       = "0.13"
+tar        = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

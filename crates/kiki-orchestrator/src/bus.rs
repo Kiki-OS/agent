@@ -48,6 +48,8 @@ impl From<AgentEvent> for WrappedAgentEvent {
             AgentEvent::Healing       { attempt, error } => ("healing",       serde_json::json!({ "attempt": attempt, "error": error })),
             AgentEvent::Done          { session_id, steps } => ("done",       serde_json::json!({ "session_id": session_id, "steps": steps })),
             AgentEvent::Error         { error }         => ("error",          serde_json::json!({ "error": error })),
+            AgentEvent::TokenUsage    { used, limit }   => ("token_usage",     serde_json::json!({ "used": used, "limit": limit })),
+            AgentEvent::SnapshotCaptured { snapshot_id, .. } => ("snapshot_captured", serde_json::json!({ "snapshot_id": snapshot_id })),
         };
         Self { kind: kind.into(), payload }
     }

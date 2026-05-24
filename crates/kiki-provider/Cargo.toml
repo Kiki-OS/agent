@@ -23,3 +23,4 @@ serde_json  = { workspace = true }
 async-trait = { workspace = true }
 kiki-core   = { workspace = true }
 kiki-state  = { workspace = true }
+kiki-mcp    = { workspace = true }

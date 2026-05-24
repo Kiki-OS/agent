@@ -5,7 +5,10 @@ edition.workspace = true
 workspace   = "./../.."
 
 [dependencies]
-kiki-core   = { workspace = true }
+kiki-core    = { workspace = true }
+kiki-net     = { workspace = true }
+kiki-sandbox = { workspace = true }
+kiki-schema  = { path = "../../../kiki-sdk/crates/kiki-schema" }
 tokio       = { workspace = true }
 async-trait = { workspace = true }
 futures     = { workspace = true }
@@ -16,3 +19,6 @@ tracing     = { workspace = true }
 toml        = "0.8"
 lazy_static = "1.5"
 regex       = "1.10"
+
+[dev-dependencies]
+wiremock = "0.6"

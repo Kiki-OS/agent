@@ -15,7 +15,8 @@ pub mod parser;
 pub mod server;
 
 pub use client::McpClient;
-pub use hub::{McpHub, McpToolSpec, RegisteredServer};
-pub use loader::{ArtifactManifest, PluginLoader};
+pub use hub::{InstalledApp, McpHub, McpToolSpec, RegisteredServer};
+pub use kiki_schema::ArtifactManifest;
+pub use loader::{scan_egress_allowlists, PluginLoader};
 pub use parser::{ParsedChunk, ToolCallParser};
 pub use server::McpServer;

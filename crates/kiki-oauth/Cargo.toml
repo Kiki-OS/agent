@@ -1,0 +1,23 @@
+[package]
+name                   = "kiki-oauth"
+description            = "Kiki on-device OAuth → kiki-config Secrets — per-account credentials for L2 apps"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+reqwest     = { workspace = true }
+async-trait = { workspace = true }
+kiki-net    = { workspace = true }
+kiki-config = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
