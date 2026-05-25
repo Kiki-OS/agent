@@ -1,0 +1,28 @@
+name: Agent Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install ostree (for integration tests)
+        run: sudo apt-get install -y ostree
+
+      - name: Run tests
+        run: cargo test --workspace
+        env:
+          KIKI_SKIP_OOBE: "1"
