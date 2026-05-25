@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 
 use kiki_core::{Capability, NodePolicy};
 use kiki_registry_client::{
-    ArtifactUri, RegistryClient, RegistryError, ResolvedArtifact, TrustRoot, VersionSpec,
+    ArtifactSummary, ArtifactUri, RegistryClient, RegistryError, ResolvedArtifact, TrustRoot,
+    VersionSpec,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -235,6 +236,27 @@ impl ArtifactManager {
             }
         }
         Ok(out)
+    }
+
+    /// Search the registry catalog. `query` matches name/description, `type_filter`
+    /// scopes to an artifact type (app, model, provider…). Read-only: this is an
+    /// unauthenticated catalog browse, so it needs no trust root (signatures are
+    /// only verified at install, when a blob is actually fetched).
+    pub async fn search(
+        &self,
+        query: Option<&str>,
+        type_filter: Option<&str>,
+    ) -> Result<Vec<ArtifactSummary>> {
+        let client = RegistryClient::new(self.trust.clone())
+            .map_err(|e| PkgError::Registry(e.to_string()))?;
+        Ok(client.list_catalog(&self.registry_url, query, type_filter).await?)
+    }
+
+    /// Fetch a single artifact's catalog entry by full id.
+    pub async fn info(&self, id: &str) -> Result<ArtifactSummary> {
+        let client = RegistryClient::new(self.trust.clone())
+            .map_err(|e| PkgError::Registry(e.to_string()))?;
+        Ok(client.get_artifact(&self.registry_url, id).await?)
     }
 
     // ── Pipeline steps ─────────────────────────────────────────────────────────

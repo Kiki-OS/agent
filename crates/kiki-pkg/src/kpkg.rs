@@ -42,6 +42,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Search the registry catalog (browse before installing).
+    Search {
+        /// Free-text query matched against name/description.
+        query: Option<String>,
+        /// Scope to an artifact type: app | model | provider | component | …
+        #[arg(long = "type")]
+        type_filter: Option<String>,
+    },
+    /// Show a single artifact's catalog entry by full id.
+    Info { id: String },
     /// Install an artifact by id (`<ns>/<name>`, optionally pinned to a version).
     Install { id: String, #[arg(long)] version: Option<String> },
     /// Remove an installed artifact.
@@ -169,11 +179,19 @@ async fn main() -> anyhow::Result<()> {
         other => other,
     };
 
+    // Search/info are read-only catalog browses — they verify no signatures, so a
+    // missing trust dir shouldn't block them. Install/update/remove still
+    // fail-closed on an empty trust root (enforced inside the manager).
+    let read_only = matches!(artifact_cmd, Cmd::Search { .. } | Cmd::Info { .. });
     let trust = if cli.fetch_trust {
         eprintln!("warning: fetching trust root over the wire (insecure; bootstrap only)");
         kiki_registry_client::RegistryClient::fetch_trust(&cli.registry).await?
     } else {
-        TrustRoot::from_dir(&cli.trust_dir)?
+        match TrustRoot::from_dir(&cli.trust_dir) {
+            Ok(t) => t,
+            Err(_) if read_only => TrustRoot::new(),
+            Err(e) => return Err(e.into()),
+        }
     };
 
     let mut mgr = ArtifactManager::new(cli.apps_dir, &cli.registry)
@@ -184,6 +202,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match artifact_cmd {
+        Cmd::Search { query, type_filter } => {
+            let items = mgr.search(query.as_deref(), type_filter.as_deref()).await?;
+            if items.is_empty() {
+                println!("no artifacts found");
+            }
+            for a in items {
+                let desc = a.description.unwrap_or_default();
+                println!("{}\t{}\t{}\t{}", a.id, a.version, a.artifact_type, desc);
+            }
+        }
+        Cmd::Info { id } => {
+            let a = mgr.info(&id).await?;
+            println!("id:          {}", a.id);
+            println!("name:        {}", a.name);
+            println!("version:     {}", a.version);
+            println!("type:        {}", a.artifact_type);
+            println!("license:     {}", a.license);
+            if let Some(d) = a.description {
+                println!("description: {d}");
+            }
+        }
         Cmd::Install { id, version } => {
             let a = mgr.install(InstallRequest { id, version }).await?;
             println!("installed {} {}", a.id, a.path.display());
