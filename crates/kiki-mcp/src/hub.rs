@@ -59,11 +59,26 @@ pub struct RegisteredServer {
     pub call_tx:     tokio::sync::mpsc::Sender<ToolCallRequest>,
 }
 
+/// Whether a tool mutates/performs work or is a read-only view of an app's
+/// state. Mirrors `kiki_sdk::ToolKind` (the SDK repo). A `View` is the agent-first
+/// way an app exposes its structured STATE — the agent reads it to perceive the
+/// app's internals, distinct from `Action`s that change things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    #[default]
+    Action,
+    View,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolSpec {
     pub name:         String,
     pub description:  String,
     pub input_schema: Value,
+    /// `action` (default) or `view`. Absent in the handshake (older apps) ⇒ action.
+    #[serde(default)]
+    pub kind:         ToolKind,
 }
 
 /// Summary of one installed artifact, for the shell launcher's app grid.
@@ -176,7 +191,13 @@ impl McpHub {
             for spec in &server.tools {
                 let call_tx   = server.call_tx.clone();
                 let tool_name = spec.name.clone();
-                let desc      = spec.description.clone();
+                // Tell the agent which tools are read-only perception (views) vs
+                // state-mutating actions, so it reads state freely but treats
+                // actions as consequential.
+                let desc = match spec.kind {
+                    ToolKind::View => format!("[read-only view of app state] {}", spec.description),
+                    ToolKind::Action => spec.description.clone(),
+                };
                 let schema    = spec.input_schema.clone();
 
                 registry.register(McpProxyTool {
@@ -227,5 +248,30 @@ impl Tool for McpProxyTool {
             .map_err(|_| Error::Transport("MCP proxy reply channel dropped".into()))??;
 
         Ok(ToolOutput::ok(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tool spec from the SDK handshake carries `kind`; older apps that omit it
+    /// default to `action`. This locks wire-compat with `kiki_sdk::ToolKind`.
+    #[test]
+    fn tool_spec_kind_defaults_and_parses() {
+        let action: McpToolSpec = serde_json::from_value(serde_json::json!({
+            "name": "notes.add", "description": "Add", "input_schema": {}
+        })).unwrap();
+        assert_eq!(action.kind, ToolKind::Action, "absent kind ⇒ action");
+
+        let view: McpToolSpec = serde_json::from_value(serde_json::json!({
+            "name": "notes.state", "description": "State", "input_schema": {}, "kind": "view"
+        })).unwrap();
+        assert_eq!(view.kind, ToolKind::View);
+
+        let explicit: McpToolSpec = serde_json::from_value(serde_json::json!({
+            "name": "x", "description": "y", "input_schema": {}, "kind": "action"
+        })).unwrap();
+        assert_eq!(explicit.kind, ToolKind::Action);
     }
 }

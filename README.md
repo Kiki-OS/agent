@@ -96,7 +96,7 @@ cargo build --release
 |---|---|
 | [os](https://github.com/Kiki-OS/os) | OS images (embeds the `agentd` binary) |
 | [sdk](https://github.com/Kiki-OS/sdk) | App developer SDK |
-| [wm](https://github.com/Kiki-OS/wm) | Wayland compositor (reads `ControlMode` from agentd) |
+| [de](https://github.com/Kiki-OS/de) | The desktop environment (reads `ControlMode` from agentd; graphics optional) |
 
 ---
 

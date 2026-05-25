@@ -11,11 +11,11 @@ use kiki_core::{
     capability::CapabilitySet,
     context::{Context, ControlMode},
     gate::CapabilityGate,
-    harness::{AgentConfig, Harness, HarnessConfig},
-    surface::SurfaceSignal,
-    types::ControlMessage,
+    harness::{AgentConfig, Harness, HarnessConfig, HarnessOutcome},
+    surface::{SessionLayout, SurfaceSignal},
+    types::{ControlMessage, SurfaceInfo},
 };
-use kiki_mcp::{McpHub, McpServer, PluginLoader};
+use kiki_mcp::{McpHub, McpServer, McpToolSpec, PluginLoader, RegisteredServer, ToolCallRequest, ToolKind};
 use kiki_orchestrator::{
     bus::EventBus,
     dreamer::Dreamer,
@@ -36,7 +36,7 @@ struct Args {
     no_fleet: bool,
 
     #[arg(long)]
-    no_wm: bool,
+    no_de: bool,
 }
 
 // ── Config schema ─────────────��───────────────────────────────────────────────
@@ -342,6 +342,12 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP server failed to start: {e}"))?;
     info!(socket = %cfg.sockets.mcp, "MCP server started");
 
+    // The compositor's surface inventory cache (agent-first perception). Populated
+    // by the control socket; read by the built-in `screen.inventory` tool, which
+    // is registered below once the shell event stream exists.
+    let surface_cache: Arc<std::sync::Mutex<Vec<SurfaceInfo>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // ── 3. Plugin loader — scan /var/kiki/apps for installed artifacts ────────
     // Capabilities the operator granted to installed artifacts (written by kpkg
     // on approval). Deny-by-default when the policy file is absent.
@@ -452,12 +458,27 @@ async fn main() -> anyhow::Result<()> {
     // Pre-serialized ShellEvent JSON lines fan out to every connected shell.
     let (shell_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
-    // Surface signal drain (log them for now; wm will read over IPC)
-    tokio::spawn(async move {
-        while let Some(sig) = surface_rx.recv().await {
-            tracing::debug!(?sig, "surface signal");
-        }
-    });
+    // Built-in `screen` tool server (agent-first window management). Exposes
+    // `screen.inventory` (read the surface cache) + `screen.set_layout` (emit a
+    // layout intent to the DE compositor). Registered here, after shell_tx exists.
+    register_screen_tool_server(&hub, surface_cache.clone(), shell_tx.clone());
+    info!("built-in screen.* tools registered (perception + layout)");
+
+    // Surface signal drain: forward agent layout intents to the DE; log the rest.
+    {
+        let events = shell_tx.clone();
+        tokio::spawn(async move {
+            while let Some(sig) = surface_rx.recv().await {
+                if let SurfaceSignal::RequestLayout { layout } = &sig {
+                    if let Some(line) = layout_event_line(layout) {
+                        let _ = events.send(line);
+                    }
+                } else {
+                    tracing::debug!(?sig, "surface signal");
+                }
+            }
+        });
+    }
 
     // Catalog refresh: when an artifact registers/unregisters after a shell is
     // already connected, re-broadcast the command palette + launcher app grid so
@@ -474,13 +495,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start control socket listener
-    if !args.no_wm {
+    if !args.no_de {
         let socket_path = cfg.sockets.control.clone();
         let ctrl_tx     = control_tx.clone();
         let events      = shell_tx.clone();
         let hub_ctl     = hub.clone();
+        let surfaces    = surface_cache.clone();
         tokio::spawn(async move {
-            run_control_socket(socket_path, ctrl_tx, events, hub_ctl).await;
+            run_control_socket(socket_path, ctrl_tx, events, hub_ctl, surfaces).await;
         });
         info!(socket = %cfg.sockets.control, "control socket listener started");
     }
@@ -503,7 +525,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        _ => fresh_session(&format!("session-{}", now_ms()), control_mode, state.clone()),
+        // Local resume (no fleet): reconstruct a parked session from its on-disk
+        // snapshot. Falls back to fresh if none exists.
+        Some(id) => match resume_from_local(id, &state_dir, state.clone()) {
+            Some(pair) => {
+                info!(session = %id, "resumed parked session from local snapshot");
+                pair
+            }
+            None => {
+                info!(session = %id, "no local snapshot for session — starting fresh");
+                fresh_session(id, control_mode, state.clone())
+            }
+        },
+        None => fresh_session(&format!("session-{}", now_ms()), control_mode, state.clone()),
     };
     sessions.add(session.clone());
     let session_id = session.id.clone();
@@ -662,6 +696,21 @@ async fn main() -> anyhow::Result<()> {
             }
 
             match outcome {
+                // Local park (Freeze with no migration target): persist a resumable
+                // bundle to disk and mark the session frozen — NOT complete, so the
+                // dreamer doesn't consolidate it as finished.
+                Ok(HarnessOutcome::Frozen) => {
+                    match park_locally(&harness.ctx).await {
+                        Ok(bundle_id) => {
+                            info!(session = %session_id, %bundle_id, "session parked (local snapshot)");
+                            session.confirm_freeze();
+                        }
+                        Err(e) => {
+                            error!(session = %session_id, error = %e, "park snapshot failed");
+                            session.fail(format!("park failed: {e}"));
+                        }
+                    }
+                }
                 Ok(outcome) => {
                     let messages = harness.ctx.messages.clone();
                     info!(session = %session_id, ?outcome, "session complete");
@@ -737,13 +786,123 @@ impl AgentConfig for KikiAssistantAgent {
     }
 }
 
-// ── Control socket listener ─────────────────��─────────────────────────────────
+// ── Built-in `screen` tool server ─────────────────────────────────────────────
+
+/// Register the in-process `screen` tool server. It runs no external process: it
+/// reads the surface inventory the compositor pushes over the control socket and
+/// returns it to the agent. This is the agent-first perception channel — the
+/// agent calls `screen.inventory` instead of taking a screenshot.
+fn register_screen_tool_server(
+    hub:      &Arc<McpHub>,
+    cache:    Arc<std::sync::Mutex<Vec<SurfaceInfo>>>,
+    shell_tx: tokio::sync::broadcast::Sender<String>,
+) {
+    let (call_tx, mut call_rx) = mpsc::channel::<ToolCallRequest>(32);
+    let tools = vec![
+        McpToolSpec {
+            name:        "screen.inventory".to_string(),
+            description: "List the windows/surfaces currently on screen as structured data \
+                          (app id, title, geometry, focus). The agent's primary way to perceive \
+                          the screen — no screenshot needed."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object", "properties": {}, "additionalProperties": false
+            }),
+            kind: ToolKind::View,
+        },
+        McpToolSpec {
+            name:        "screen.set_layout".to_string(),
+            description: "Set the on-screen layout INTENT for app surfaces. The agent expresses \
+                          intent; the compositor owns the geometry. One of: fullscreen, split_two, \
+                          split_6040, focus_context, grid_four, ambient."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "layout": {
+                        "type": "string",
+                        "enum": ["fullscreen", "split_two", "split_6040", "focus_context", "grid_four", "ambient"]
+                    }
+                },
+                "required": ["layout"],
+                "additionalProperties": false
+            }),
+            kind: ToolKind::Action,
+        },
+    ];
+    hub.register(RegisteredServer {
+        artifact_id: "kiki.screen".to_string(),
+        version:     env!("CARGO_PKG_VERSION").to_string(),
+        tools,
+        call_tx,
+    });
+    tokio::spawn(async move {
+        while let Some(req) = call_rx.recv().await {
+            let result = match req.tool_name.as_str() {
+                "screen.inventory" => {
+                    let surfaces = cache.lock().map(|c| c.clone()).unwrap_or_default();
+                    Ok(serde_json::json!({ "surfaces": surfaces }))
+                }
+                "screen.set_layout" => {
+                    let arg = req.input.get("layout").and_then(|v| v.as_str()).unwrap_or("");
+                    match parse_layout_arg(arg) {
+                        Some(layout) => {
+                            if let Some(line) = layout_event_line(&layout) {
+                                let _ = shell_tx.send(line);
+                            }
+                            Ok(serde_json::json!({ "ok": true, "layout": arg }))
+                        }
+                        None => Err(kiki_core::error::Error::ToolExecution(
+                            format!("unknown layout: {arg}"),
+                        )),
+                    }
+                }
+                other => Err(kiki_core::error::Error::ToolNotFound(other.to_string())),
+            };
+            let _ = req.reply_tx.send(result);
+        }
+    });
+}
+
+/// Translate the agent's layout intent into a DE `ShellEvent::Layout` line. The
+/// DE (GPL) and agentd (MIT) share no code, only this JSON shape — the DE's
+/// `kiki_session::SessionLayout` serialization (rename_all snake_case).
+fn layout_event_line(layout: &SessionLayout) -> Option<String> {
+    let layout_json = match layout {
+        // The DE has no Ambient surface layout; the app-centric equivalent is
+        // fullscreen (agent steps back, the app owns the screen).
+        SessionLayout::Fullscreen | SessionLayout::Ambient => serde_json::json!("fullscreen"),
+        SessionLayout::SplitTwo { ratio_agent } => {
+            let ratio = if (45..=55).contains(ratio_agent) { "equal" } else { "sixty_forty" };
+            serde_json::json!({ "split_two": ratio })
+        }
+        SessionLayout::FocusContext => serde_json::json!("focus_context"),
+        SessionLayout::GridFour => serde_json::json!("grid_four"),
+    };
+    Some(serde_json::json!({ "type": "layout", "layout": layout_json }).to_string())
+}
+
+/// Parse a `screen.set_layout` argument into a layout intent.
+fn parse_layout_arg(s: &str) -> Option<SessionLayout> {
+    match s {
+        "fullscreen"            => Some(SessionLayout::Fullscreen),
+        "split_two" | "split"   => Some(SessionLayout::SplitTwo { ratio_agent: 50 }),
+        "split_6040"            => Some(SessionLayout::SplitTwo { ratio_agent: 60 }),
+        "focus_context" | "focus" => Some(SessionLayout::FocusContext),
+        "grid_four" | "grid"    => Some(SessionLayout::GridFour),
+        "ambient"               => Some(SessionLayout::Ambient),
+        _                       => None,
+    }
+}
+
+// ── Control socket listener ─────────────────────────────────────────────────
 
 async fn run_control_socket(
-    path:   String,
-    tx:     mpsc::Sender<ControlMessage>,
-    events: tokio::sync::broadcast::Sender<String>,
-    hub:    Arc<McpHub>,
+    path:     String,
+    tx:       mpsc::Sender<ControlMessage>,
+    events:   tokio::sync::broadcast::Sender<String>,
+    hub:      Arc<McpHub>,
+    surfaces: Arc<std::sync::Mutex<Vec<SurfaceInfo>>>,
 ) {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -763,6 +922,7 @@ async fn run_control_socket(
         match listener.accept().await {
             Ok((stream, _)) => {
                 let tx2 = tx.clone();
+                let surfaces2 = surfaces.clone();
                 let mut ev_rx = events.subscribe();
                 // Snapshot the current command catalog + installed apps for this shell.
                 let commands_line = commands_available_line(&hub);
@@ -787,6 +947,16 @@ async fn run_control_socket(
                     let mut lines = BufReader::new(read).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         match serde_json::from_str::<ControlMessage>(&line) {
+                            // Perception channel: cache the compositor's surface
+                            // inventory and serve it via `screen.inventory`. This is
+                            // NOT a command for the harness, so don't forward it.
+                            Ok(ControlMessage::SurfaceInventory { surfaces: surf }) => {
+                                let count = surf.len();
+                                if let Ok(mut c) = surfaces2.lock() {
+                                    *c = surf;
+                                }
+                                tracing::debug!(surfaces = count, "surface inventory updated");
+                            }
                             Ok(msg) => {
                                 // Persist user corrections to memory immediately
                                 // (best-effort), before forwarding to the harness.
@@ -817,7 +987,7 @@ async fn run_control_socket(
 }
 
 /// Map an [`AgentEvent`] to a ShellEvent JSON line for the shell HUD stream.
-/// The wire format must match `kiki_shell_core::ShellEvent` (the WM repo mirrors
+/// The wire format must match `kiki_shell_core::ShellEvent` (the DE repo mirrors
 /// this protocol; the two repos share no code). Returns None for events the
 /// shell doesn't render.
 fn shell_event_line(event: &kiki_core::harness::AgentEvent) -> Option<String> {
@@ -1025,18 +1195,9 @@ async fn resume_from_cloud(
 /// target node (e.g. `cloud-<session>`). Lives here because kiki-core (the
 /// harness) can't depend on kiki-fleet — it signals intent via
 /// `Harness::pending_migration` and main performs the transport.
-async fn send_migration_to(
-    target:  &str,
-    ctx:     &Context,
-    cfg:     &Config,
-    node_id: &str,
-) -> anyhow::Result<()> {
-    use kiki_core::state::RuntimeSnapshot;
-
-    let registry = std::env::var("KIKI_REGISTRY_URL")
-        .unwrap_or_else(|_| "https://registry.kiki-os.com".into());
-
-    let runtime = RuntimeSnapshot {
+/// Serialize a live [`Context`] into a [`RuntimeSnapshot`] for park/migration.
+fn runtime_from_ctx(ctx: &Context) -> kiki_core::state::RuntimeSnapshot {
+    kiki_core::state::RuntimeSnapshot {
         agent_id:        ctx.agent_id.clone(),
         session_id:      ctx.session_id.clone(),
         step:            ctx.steps_taken() as u64,
@@ -1047,7 +1208,68 @@ async fn send_migration_to(
         scenario:        ctx.scenario.clone(),
         layout:          ctx.layout,
         active_apps:     ctx.active_apps.clone(),
-    };
+    }
+}
+
+/// Park a session locally: snapshot its runtime to a durable bundle on disk
+/// (the FileBackend writes `{state_dir}/snapshots/{bundle_id}.json`). No cloud —
+/// the bundle is resumable on this host via [`resume_from_local`]. Returns the
+/// bundle id.
+async fn park_locally(ctx: &Context) -> anyhow::Result<String> {
+    let runtime = runtime_from_ctx(ctx);
+    let bundle = ctx.state.snapshot(runtime).await
+        .map_err(|e| anyhow::anyhow!("park snapshot: {e}"))?;
+    Ok(bundle.bundle_id)
+}
+
+/// Resume a parked session from the local snapshot store: find the latest bundle
+/// for `session_id` under `{state_dir}/snapshots` and reconstruct the session +
+/// context. No fleet — the bundle is on local disk. `None` if no snapshot exists.
+fn resume_from_local(
+    session_id: &str,
+    state_dir:  &str,
+    state:      Arc<dyn kiki_core::state::StateBackend>,
+) -> Option<(Arc<AgentSession>, Context)> {
+    // Bundle files are named `{session_id}-step{N}.json`; pick the highest step.
+    let snaps  = std::path::Path::new(state_dir).join("snapshots");
+    let prefix = format!("{session_id}-step");
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(&snaps).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(step) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".json"))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if best.as_ref().map_or(true, |(b, _)| step > *b) {
+            best = Some((step, entry.path()));
+        }
+    }
+    let (_, path) = best?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let bundle: kiki_core::state::MigrationBundle = serde_json::from_str(&data).ok()?;
+    let ctx = Context::from_snapshot(&bundle.runtime, state.clone(), CapabilitySet::new());
+    let session = Arc::new(AgentSession::new(
+        bundle.session_id.clone(),
+        bundle.runtime.session_label.clone(),
+        bundle.runtime.agent_id.clone(),
+        state,
+    ));
+    Some((session, ctx))
+}
+
+async fn send_migration_to(
+    target:  &str,
+    ctx:     &Context,
+    cfg:     &Config,
+    node_id: &str,
+) -> anyhow::Result<()> {
+    let registry = std::env::var("KIKI_REGISTRY_URL")
+        .unwrap_or_else(|_| "https://registry.kiki-os.com".into());
+
+    let runtime = runtime_from_ctx(ctx);
 
     let bundle = ctx.state.snapshot(runtime).await
         .map_err(|e| anyhow::anyhow!("snapshot: {e}"))?;
@@ -1271,6 +1493,21 @@ async fn spawn_fleet(setup: FleetSetup) {
                         info!(snapshot = %snapshot_id, "fleet: capture-snapshot requested");
                         let _ = ctrl_tx.send(ControlMessage::CaptureSnapshot { snapshot_id }).await;
                     }
+                    Some(kiki_fleet::DeviceInbound::UserInput { text }) => {
+                        // A remote controller is driving the agent: feed the prompt
+                        // into the harness control loop as a new task.
+                        info!(len = text.len(), "fleet: remote user_input");
+                        let _ = ctrl_tx.send(ControlMessage::UserInput { text }).await;
+                    }
+                    Some(kiki_fleet::DeviceInbound::StopSession) => {
+                        info!("fleet: remote stop-session");
+                        // Session id is ignored by the harness (it stops the active one).
+                        let _ = ctrl_tx.send(ControlMessage::StopSession { session_id: String::new() }).await;
+                    }
+                    Some(kiki_fleet::DeviceInbound::ParkSession) => {
+                        info!("fleet: remote park-session");
+                        let _ = ctrl_tx.send(ControlMessage::ParkSession { session_id: String::new() }).await;
+                    }
                     None => break, // relay dropped → reconnect
                 },
             }
@@ -1281,11 +1518,141 @@ async fn spawn_fleet(setup: FleetSetup) {
 
 fn approval_from_resolution(v: &serde_json::Value) -> kiki_core::types::ApprovalDecision {
     use kiki_core::types::ApprovalDecision;
-    let s = v.get("decision").and_then(|d| d.as_str())
+    // The client (app/web) sends `{ kind: "approved" | "rejected" | "redirected", new_intent? }`.
+    // Accept the legacy `decision` field and a bare string too.
+    let s = v.get("kind").and_then(|d| d.as_str())
+        .or_else(|| v.get("decision").and_then(|d| d.as_str()))
         .or_else(|| v.as_str())
         .unwrap_or("");
     match s {
         "approve" | "approved" | "allow" | "yes" => ApprovalDecision::Approved,
+        "redirect" | "redirected" => ApprovalDecision::Redirected {
+            new_intent: v.get("new_intent").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        },
         _ => ApprovalDecision::Rejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// End-to-end of the agent-first perception channel WITHOUT a display: the
+    /// compositor's `SurfaceInventory` arrives over the control socket → agentd
+    /// caches it → the agent reads it back via the `screen.inventory` tool.
+    #[tokio::test]
+    async fn perception_channel_socket_to_tool() {
+        let hub = Arc::new(McpHub::new());
+        let cache: Arc<std::sync::Mutex<Vec<SurfaceInfo>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (shell_tx, _) = tokio::sync::broadcast::channel::<String>(8);
+        register_screen_tool_server(&hub, cache.clone(), shell_tx);
+
+        // Stand up the real control socket on a temp path.
+        let sock = std::env::temp_dir().join(format!("agentd-perc-{}.sock", std::process::id()));
+        let sock_path = sock.to_string_lossy().to_string();
+        let (tx, _ctrl_rx) = mpsc::channel::<ControlMessage>(8);
+        let (events, _) = tokio::sync::broadcast::channel::<String>(8);
+        {
+            let (path, tx, events, hub, cache) =
+                (sock_path.clone(), tx.clone(), events.clone(), hub.clone(), cache.clone());
+            tokio::spawn(async move {
+                run_control_socket(path, tx, events, hub, cache).await;
+            });
+        }
+        // Wait for the socket to bind.
+        for _ in 0..100 {
+            if std::path::Path::new(&sock_path).exists() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The compositor pushes an inventory line.
+        let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let line = r#"{"type":"surface_inventory","surfaces":[{"app_id":"org.gnome.TextEditor","title":"notes.md","x":0,"y":0,"w":1280,"h":800,"focused":true}]}"#;
+        client.write_all(line.as_bytes()).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        // The agent calls the tool and must see the cached inventory.
+        let mut got = None;
+        for _ in 0..100 {
+            let result = hub.call("screen.inventory", serde_json::json!({})).await.unwrap();
+            let surfaces = result.get("surfaces").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+            if !surfaces.is_empty() {
+                got = Some(surfaces);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let surfaces = got.expect("screen.inventory should return the pushed surface");
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0]["app_id"], "org.gnome.TextEditor");
+        assert_eq!(surfaces[0]["title"], "notes.md");
+        assert_eq!(surfaces[0]["w"], 1280);
+        assert_eq!(surfaces[0]["focused"], true);
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// Agent-driven layout: calling `screen.set_layout` emits a `ShellEvent::Layout`
+    /// line on the shell stream in the exact wire shape the DE expects.
+    #[tokio::test]
+    async fn set_layout_emits_shell_event() {
+        let hub = Arc::new(McpHub::new());
+        let cache: Arc<std::sync::Mutex<Vec<SurfaceInfo>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (shell_tx, mut shell_rx) = tokio::sync::broadcast::channel::<String>(16);
+        register_screen_tool_server(&hub, cache, shell_tx);
+
+        let result = hub
+            .call("screen.set_layout", serde_json::json!({ "layout": "split_two" }))
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+
+        let line = shell_rx.recv().await.unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ev["type"], "layout");
+        assert_eq!(ev["layout"]["split_two"], "equal");
+
+        // 60/40 maps to the sixty_forty ratio.
+        hub.call("screen.set_layout", serde_json::json!({ "layout": "split_6040" })).await.unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&shell_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ev["layout"]["split_two"], "sixty_forty");
+
+        // Unknown layout is an error, no event emitted.
+        assert!(hub.call("screen.set_layout", serde_json::json!({ "layout": "bogus" })).await.is_err());
+    }
+
+    /// F5: a session parked to local disk can be resumed with its full context
+    /// (messages/label/step), no fleet/OSTree involved.
+    #[tokio::test]
+    async fn local_park_then_resume_round_trips() {
+        let dir = std::env::temp_dir().join(format!("kiki-f5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state: Arc<dyn kiki_core::state::StateBackend> =
+            Arc::new(kiki_state::FileBackend::open(dir.to_str().unwrap()).unwrap());
+
+        let sid = "session-test-f5";
+        let mut ctx = Context::new("kiki-assistant", sid, state.clone());
+        ctx.label = "Build the OS".to_string();
+        ctx.push_user_text("remember this across park/resume");
+
+        let bundle_id = park_locally(&ctx).await.unwrap();
+        assert!(bundle_id.starts_with(sid), "bundle id: {bundle_id}");
+
+        let (session, resumed) = resume_from_local(sid, dir.to_str().unwrap(), state.clone())
+            .expect("should resume the parked session");
+        assert_eq!(session.id, sid);
+        assert_eq!(resumed.label, "Build the OS");
+        assert_eq!(resumed.session_id, sid);
+        assert_eq!(resumed.messages.len(), ctx.messages.len());
+
+        // Unknown session ⇒ None (caller falls back to a fresh session).
+        assert!(resume_from_local("nope", dir.to_str().unwrap(), state).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

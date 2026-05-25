@@ -1,6 +1,6 @@
 //! Surface signals: the harness → compositor communication channel.
 //!
-//! The harness emits these signals over a tokio channel; the compositor (kiki-wmd)
+//! The harness emits these signals over a tokio channel; the compositor (kiki-ded)
 //! listens on the IPC socket and translates them into Wayland surface operations.
 //!
 //! Design principle: the agent drives UI intent, the compositor owns layout policy.
@@ -14,7 +14,7 @@ use serde_json::Value;
 /// The agent's desired screen layout for this session.
 /// The compositor translates this to concrete Wayland surface geometry.
 ///
-/// Also defined in kiki-wm/crates/kiki-session — serialized identically for IPC.
+/// Also defined in kiki-de/crates/kiki-session — serialized identically for IPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLayout {

@@ -159,6 +159,26 @@ pub enum ControlMessage {
     /// Capture a point-in-time snapshot of the current session and upload it as
     /// fleet snapshot `snapshot_id` (for multiply / clone). Does not freeze.
     CaptureSnapshot { snapshot_id: String },
+
+    /// The compositor's structured view of what is on screen, pushed whenever the
+    /// surface set changes. The agent-first perception channel: agentd caches the
+    /// latest inventory and exposes it via the built-in `screen.inventory` tool so
+    /// the agent perceives the screen as DATA (not by scraping a pixel a11y tree).
+    SurfaceInventory { surfaces: Vec<SurfaceInfo> },
+}
+
+/// One on-screen surface as the compositor sees it. Byte-compatible with
+/// `kiki_shell_core::SurfaceInfo` in the DE repo (the two repos share no code,
+/// only this JSON shape).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceInfo {
+    pub app_id:  String,
+    pub title:   String,
+    pub x:       i32,
+    pub y:       i32,
+    pub w:       i32,
+    pub h:       i32,
+    pub focused: bool,
 }
 
 /// User's response to an in-context approval dialog.
@@ -174,3 +194,49 @@ pub enum ApprovalDecision {
 // ─── Legacy compatibility re-exports ─────────────────────────────────────────
 
 pub use crate::state::{MigrationBundle, OstreeCheckpoint, RuntimeSnapshot};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SurfaceInventory wire shape MUST match `kiki_shell_core::ControlMessage`
+    /// in the DE repo (the two repos share no code). This fixes the JSON so cross-
+    /// repo drift is caught.
+    #[test]
+    fn surface_inventory_wire_matches_de() {
+        let m = ControlMessage::SurfaceInventory {
+            surfaces: vec![SurfaceInfo {
+                app_id: "org.gnome.TextEditor".into(),
+                title: "Untitled".into(),
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+                focused: true,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({
+                "type": "surface_inventory",
+                "surfaces": [{
+                    "app_id": "org.gnome.TextEditor",
+                    "title": "Untitled",
+                    "x": 0, "y": 0, "w": 800, "h": 600,
+                    "focused": true
+                }]
+            })
+        );
+
+        // And it round-trips from the DE's serialized form.
+        let line = r#"{"type":"surface_inventory","surfaces":[{"app_id":"a","title":"t","x":1,"y":2,"w":3,"h":4,"focused":false}]}"#;
+        match serde_json::from_str::<ControlMessage>(line).unwrap() {
+            ControlMessage::SurfaceInventory { surfaces } => {
+                assert_eq!(surfaces.len(), 1);
+                assert_eq!(surfaces[0].app_id, "a");
+                assert_eq!(surfaces[0].w, 3);
+            }
+            other => panic!("expected SurfaceInventory, got {other:?}"),
+        }
+    }
+}

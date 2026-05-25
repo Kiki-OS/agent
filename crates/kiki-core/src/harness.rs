@@ -569,6 +569,10 @@ impl Harness {
                 }
                 Ok(LoopControl::Continue)
             }
+            // Perception data, not a harness command — agentd intercepts it before
+            // the command channel and caches it for `screen.inventory`. Handled
+            // defensively here so the harness never chokes if one slips through.
+            ControlMessage::SurfaceInventory { .. } => Ok(LoopControl::Continue),
         }
     }
 

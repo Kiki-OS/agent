@@ -71,6 +71,12 @@ pub enum DeviceInbound {
     /// current session and upload it as fleet snapshot `snapshot_id` (used to
     /// multiply / clone the node). The session is NOT frozen.
     CaptureSnapshot { snapshot_id: String },
+    /// A remote controller sent the agent a new prompt/task to work on.
+    UserInput { text: String },
+    /// A remote controller asked to stop the active session.
+    StopSession,
+    /// A remote controller asked to park (freeze) the active session.
+    ParkSession,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +90,12 @@ enum InboundWire {
     MigrateToCloud { session_id: String },
     #[serde(rename = "capture_snapshot")]
     CaptureSnapshot { snapshot_id: String },
+    #[serde(rename = "user_input")]
+    UserInput { #[serde(default)] text: String },
+    #[serde(rename = "stop_session")]
+    StopSession,
+    #[serde(rename = "park_session")]
+    ParkSession,
     #[serde(other)]
     Other,
 }
@@ -187,6 +199,15 @@ pub async fn connect_device(
                         }
                         Ok(InboundWire::CaptureSnapshot { snapshot_id }) => {
                             if in_tx.send(DeviceInbound::CaptureSnapshot { snapshot_id }).await.is_err() { break; }
+                        }
+                        Ok(InboundWire::UserInput { text }) => {
+                            if in_tx.send(DeviceInbound::UserInput { text }).await.is_err() { break; }
+                        }
+                        Ok(InboundWire::StopSession) => {
+                            if in_tx.send(DeviceInbound::StopSession).await.is_err() { break; }
+                        }
+                        Ok(InboundWire::ParkSession) => {
+                            if in_tx.send(DeviceInbound::ParkSession).await.is_err() { break; }
                         }
                         Ok(InboundWire::Other) => {}
                         Err(e) => tracing::warn!(error = %e, "session ws parse"),

@@ -29,7 +29,7 @@ pub enum SessionPhase {
 
 /// Agent-side session: owns the PRA loop lifecycle and its migration contract.
 ///
-/// This is the agent's view of a session — distinct from kiki-wm's Session
+/// This is the agent's view of a session — distinct from kiki-de's Session
 /// (which owns the Wayland surface). They share the same `id` as the join key.
 pub struct AgentSession {
     pub id:           SessionId,
