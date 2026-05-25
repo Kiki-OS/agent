@@ -186,6 +186,7 @@ mod tests {
             scenario:        None,
             layout:          Default::default(),
             active_apps:     vec![],
+            app_states:      Default::default(),
         };
         let bundle = backend.snapshot(runtime).await.unwrap();
         assert!(bundle.checkpoint.ref_hash.is_some());
