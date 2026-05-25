@@ -17,6 +17,6 @@ pub mod server;
 pub use client::McpClient;
 pub use hub::{InstalledApp, McpHub, McpToolSpec, RegisteredServer, ToolCallRequest, ToolKind};
 pub use kiki_schema::ArtifactManifest;
-pub use loader::{scan_egress_allowlists, PluginLoader};
+pub use loader::{scan_egress_allowlists, FirecrackerConfig, PluginLoader};
 pub use parser::{ParsedChunk, ToolCallParser};
 pub use server::McpServer;

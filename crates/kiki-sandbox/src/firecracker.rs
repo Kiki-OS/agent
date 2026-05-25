@@ -139,13 +139,26 @@ pub fn kvm_available() -> bool {
     std::path::Path::new("/dev/kvm").exists()
 }
 
-/// A running microVM handle.
+/// A running microVM handle. Owns the firecracker VMM host process: dropping or
+/// killing `child` tears the guest down, so the loader tracks it alongside the
+/// host children of ordinary apps.
 #[derive(Debug)]
 pub struct MicroVm {
     pub pid:        u32,
     pub api_socket: String,
     /// Host-side vsock UDS — the app control channel into the guest.
     pub vsock_uds:  String,
+    /// The `firecracker` VMM process. Killing it stops the microVM.
+    child:          tokio::process::Child,
+}
+
+impl MicroVm {
+    /// Take the firecracker VMM process handle. The loader pushes this into the
+    /// set of artifact processes it keeps alive / reaps — killing it stops the
+    /// guest.
+    pub fn into_child(self) -> tokio::process::Child {
+        self.child
+    }
 }
 
 impl MicroVmConfig {
@@ -181,7 +194,7 @@ impl MicroVmConfig {
             .map_err(|e| FirecrackerError::Io(format!("connect api socket: {e}")))?;
         configure_over(&mut stream, self).await?;
 
-        Ok(MicroVm { pid, api_socket, vsock_uds: self.vsock_uds_path.clone() })
+        Ok(MicroVm { pid, api_socket, vsock_uds: self.vsock_uds_path.clone(), child })
     }
 }
 

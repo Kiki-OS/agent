@@ -22,6 +22,22 @@ use kiki_net::{EgressBroker, FetchRequest};
 
 const PROTOCOL_VERSION: &str = "0.1.0";
 const CHANNEL_CAP: usize = 32;
+/// Protocol features this host supports, advertised back in the handshake.
+const PROTOCOL_CAPABILITIES: &[&str] = &["tools", "views", "activity"];
+
+/// Compatible when the major versions match — and, for 0.x, the minor too
+/// (semver treats the minor as the breaking axis before 1.0). Mirrors
+/// `kiki_sdk::protocol_compatible` (the two repos share no code, only the wire).
+fn protocol_compatible(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<(u64, u64)> {
+        let mut it = v.split('.');
+        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    }
+    match (parse(a), parse(b)) {
+        (Some((amaj, amin)), Some((bmaj, bmin))) => amaj == bmaj && (amaj > 0 || amin == bmin),
+        _ => a == b,
+    }
+}
 
 pub struct McpServer {
     hub:         Arc<McpHub>,
@@ -111,18 +127,39 @@ async fn handle_connection(
     let params  = &msg["params"];
     let art_id  = params["artifactId"].as_str().unwrap_or("unknown").to_string();
     let version = params["version"].as_str().unwrap_or("0.0.0").to_string();
+    // The app's protocol version (legacy apps omit it ⇒ assume 0.1.0).
+    let app_proto = params["protocolVersion"].as_str().unwrap_or("0.1.0");
+    let id = msg["id"].clone();
+
+    // Negotiate: reject incompatible apps with a structured error (don't register).
+    if !protocol_compatible(app_proto, PROTOCOL_VERSION) {
+        warn!(artifact = %art_id, app_proto, host = PROTOCOL_VERSION, "protocol incompatible — rejecting");
+        let err = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32600,
+                "message": format!("protocol incompatible: app={app_proto} host={PROTOCOL_VERSION}")
+            }
+        });
+        let _ = send_line(&mut write_half, &err).await;
+        return;
+    }
+
     let tools: Vec<McpToolSpec> = serde_json::from_value(
         params["tools"].clone()
     ).unwrap_or_default();
 
-    info!(artifact = %art_id, tools = tools.len(), "artifact connected");
+    info!(artifact = %art_id, tools = tools.len(), app_proto, "artifact connected");
 
-    // Reply to initialize
-    let id = msg["id"].clone();
+    // Reply to initialize, advertising the host's protocol version + capabilities.
     let reply = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "result": { "protocolVersion": PROTOCOL_VERSION }
+        "result": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities":    PROTOCOL_CAPABILITIES
+        }
     });
     if let Err(e) = send_line(&mut write_half, &reply).await {
         error!(error = %e, "failed to send initialize reply");

@@ -138,6 +138,13 @@ fn default_heartbeat() -> u64    { 30 }
 struct AppsConfig {
     #[serde(default = "default_apps_dir")]
     dir: String,
+    /// Firecracker settings for untrusted (`ArtifactKind::Agent`) artifacts. Both
+    /// must be set to enable microVM isolation; otherwise such artifacts fail to
+    /// load (fail-closed). The kernel image is OS-provided and shared.
+    #[serde(default)]
+    firecracker_bin:      Option<String>,
+    #[serde(default)]
+    firecracker_kernel:   Option<String>,
 }
 
 fn default_apps_dir() -> String { "/var/kiki/apps".into() }
@@ -354,7 +361,17 @@ async fn main() -> anyhow::Result<()> {
     let policy_path = std::env::var("KIKI_POLICY_FILE")
         .unwrap_or_else(|_| "/etc/kiki/policy.json".to_string());
     let granted = load_granted_caps(&policy_path);
-    let loader  = PluginLoader::new(hub.clone(), granted.clone(), &cfg.sockets.mcp);
+    let mut loader = PluginLoader::new(hub.clone(), granted.clone(), &cfg.sockets.mcp);
+    // Enable Firecracker isolation for untrusted artifacts when both the binary
+    // and the shared guest kernel are configured. Absent ⇒ Agent artifacts
+    // fail-closed (never run on the host).
+    if let (Some(bin), Some(kernel)) = (&cfg.apps.firecracker_bin, &cfg.apps.firecracker_kernel) {
+        loader = loader.with_firecracker(kiki_mcp::FirecrackerConfig {
+            firecracker_bin: bin.clone(),
+            kernel_image:    kernel.clone(),
+        });
+        info!(bin = %bin, kernel = %kernel, "Firecracker microVM isolation enabled for untrusted artifacts");
+    }
     // Built-in apps (baked, trusted) load from cfg.apps.dir. User-installed L2
     // apps load from /var/kiki/apps, validated against the granted policy.
     // Keep the spawned artifact processes alive for the lifetime of agentd.

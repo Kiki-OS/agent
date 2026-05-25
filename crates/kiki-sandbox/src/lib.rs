@@ -19,7 +19,7 @@ pub mod seccomp;     // seccomp-bpf syscall denylist (policy + Linux enforcement
 pub mod firecracker; // Firecracker MicroVM backend for untrusted code
 pub mod wayland;     // Wayland protocol filter (per-surface isolation)
 
-pub use firecracker::{FirecrackerError, MicroVmConfig};
+pub use firecracker::{kvm_available, FirecrackerError, MicroVm, MicroVmConfig};
 pub use landlock::{FsAccess, LandlockRule, RuntimePaths};
 pub use namespace::{IsolationLevel, SandboxError, SandboxProfile};
 

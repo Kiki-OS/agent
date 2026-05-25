@@ -14,7 +14,7 @@ use kiki_core::{
     error::{Error, Result},
 };
 use kiki_schema::ArtifactManifest;
-use kiki_sandbox::SandboxProfile;
+use kiki_sandbox::{IsolationLevel, MicroVmConfig, SandboxProfile};
 use crate::hub::McpHub;
 
 // The artifact manifest is `kiki_schema::ArtifactManifest` — the single manifest
@@ -56,10 +56,23 @@ pub fn scan_egress_allowlists(root: &str) -> Vec<(String, Vec<kiki_net::HostPort
 
 // ─── PluginLoader ─────────────────────────────────────────────────────────────
 
+/// Host-level Firecracker settings, shared by every microVM-isolated artifact.
+/// The guest kernel is OS-provided (one image for all microVMs); each artifact
+/// supplies its own root filesystem image in its bundle. Absent ⇒ artifacts that
+/// require microVM isolation fail to load (fail-closed — never a host fallback).
+#[derive(Debug, Clone)]
+pub struct FirecrackerConfig {
+    /// Path to the `firecracker` binary.
+    pub firecracker_bin: String,
+    /// Path to the shared guest kernel image (vmlinux).
+    pub kernel_image:    String,
+}
+
 pub struct PluginLoader {
-    hub:        Arc<McpHub>,
-    granted:    CapabilitySet,
-    socket_dir: String,
+    hub:         Arc<McpHub>,
+    granted:     CapabilitySet,
+    socket_dir:  String,
+    firecracker: Option<FirecrackerConfig>,
 }
 
 impl PluginLoader {
@@ -68,7 +81,15 @@ impl PluginLoader {
         granted:    CapabilitySet,
         socket_dir: impl Into<String>,
     ) -> Self {
-        Self { hub, granted, socket_dir: socket_dir.into() }
+        Self { hub, granted, socket_dir: socket_dir.into(), firecracker: None }
+    }
+
+    /// Enable Firecracker-backed isolation for untrusted (`ArtifactKind::Agent`)
+    /// artifacts. Without it, such artifacts fail to load rather than run on the
+    /// host.
+    pub fn with_firecracker(mut self, config: FirecrackerConfig) -> Self {
+        self.firecracker = Some(config);
+        self
     }
 
     /// Load all artifacts from an OSTree checkout root (e.g. /var/kiki/apps).
@@ -145,42 +166,152 @@ impl PluginLoader {
                     let p = PathBuf::from(&spec.command);
                     if p.is_absolute() { p } else { dir.join(&spec.command) }
                 };
-                let mut std_cmd = std::process::Command::new(&command);
-                std_cmd
-                    .args(&spec.args)
-                    .current_dir(&dir)
-                    .env("KIKI_MCP_SOCKET", &self.socket_dir);
-                if std::env::var("KIKI_DISABLE_SANDBOX").is_err() {
-                    // Runtime paths the app legitimately needs on top of its
-                    // declared caps: its own checkout dir (binary + manifest) and
-                    // the dir holding the MCP socket it connects back on.
-                    let mcp_socket_dir = std::path::Path::new(&self.socket_dir)
-                        .parent()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "/run/kiki".to_string());
-                    let runtime = kiki_sandbox::RuntimePaths {
-                        binary_dir: dir.to_string_lossy().into_owned(),
-                        mcp_socket_dir,
-                    };
-                    let profile = SandboxProfile::for_artifact(
-                        manifest.artifact.kind,
-                        &manifest.capabilities,
-                        &manifest.permissions,
-                    )
-                    .with_runtime_paths(&runtime);
-                    profile
-                        .apply(&mut std_cmd)
-                        .map_err(|e| Error::Io(format!("sandbox {artifact_id}: {e}")))?;
+                // Runtime paths the app legitimately needs on top of its declared
+                // caps: its own checkout dir (binary + manifest) and the dir
+                // holding the MCP socket it connects back on.
+                let mcp_socket_dir = std::path::Path::new(&self.socket_dir)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/run/kiki".to_string());
+                let runtime = kiki_sandbox::RuntimePaths {
+                    binary_dir: dir.to_string_lossy().into_owned(),
+                    mcp_socket_dir,
+                };
+                let profile = SandboxProfile::for_artifact(
+                    manifest.artifact.kind,
+                    &manifest.capabilities,
+                    &manifest.permissions,
+                )
+                .with_runtime_paths(&runtime);
+
+                if profile.isolation == IsolationLevel::Firecracker {
+                    // Untrusted (LLM-executing) artifact → hardware-isolated
+                    // microVM. Fail-closed at every gap: if Firecracker isn't
+                    // configured, the host lacks KVM, or the artifact ships no
+                    // rootfs, we refuse to load it — NEVER fall back to a host
+                    // process (that would defeat the isolation this kind demands).
+                    let fc = self.firecracker.as_ref().ok_or_else(|| {
+                        Error::Io(format!(
+                            "artifact {artifact_id} requires Firecracker isolation but it is not configured"
+                        ))
+                    })?;
+                    let rootfs = dir.join("rootfs.ext4");
+                    if !rootfs.exists() {
+                        return Err(Error::Io(format!(
+                            "artifact {artifact_id}: Firecracker rootfs missing at {}",
+                            rootfs.display()
+                        )));
+                    }
+                    let vm_cfg = MicroVmConfig::for_agent(
+                        &artifact_id,
+                        &fc.kernel_image,
+                        &rootfs.to_string_lossy(),
+                    );
+                    let vm = vm_cfg
+                        .launch(&fc.firecracker_bin)
+                        .await
+                        .map_err(|e| Error::Io(format!("microvm {artifact_id}: {e}")))?;
+                    info!(
+                        artifact = %artifact_id, pid = vm.pid, vsock = %vm.vsock_uds,
+                        "artifact booted in Firecracker microVM (hardware-isolated)"
+                    );
+                    // Track the firecracker VMM process like any other child:
+                    // killing it tears the guest down.
+                    Some(vm.into_child())
+                } else {
+                    let mut std_cmd = std::process::Command::new(&command);
+                    std_cmd
+                        .args(&spec.args)
+                        .current_dir(&dir)
+                        .env("KIKI_MCP_SOCKET", &self.socket_dir);
+                    if std::env::var("KIKI_DISABLE_SANDBOX").is_err() {
+                        profile
+                            .apply(&mut std_cmd)
+                            .map_err(|e| Error::Io(format!("sandbox {artifact_id}: {e}")))?;
+                    }
+                    let child = Command::from(std_cmd)
+                        .spawn()
+                        .map_err(|e| Error::Io(format!("spawn {}: {e}", command.display())))?;
+                    info!(artifact = %artifact_id, command = %command.display(), pid = child.id(), "artifact process spawned (sandboxed)");
+                    Some(child)
                 }
-                let child = Command::from(std_cmd)
-                    .spawn()
-                    .map_err(|e| Error::Io(format!("spawn {}: {e}", command.display())))?;
-                info!(artifact = %artifact_id, command = %command.display(), pid = child.id(), "artifact process spawned (sandboxed)");
-                Some(child)
             }
             None => None,
         };
 
         Ok((artifact_id, child))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_agent_manifest(dir: &std::path::Path) {
+        // An `agent` artifact runs model output → SandboxProfile routes it to
+        // Firecracker isolation. It declares an [exec] so the loader tries to
+        // launch it.
+        std::fs::write(
+            dir.join("kiki.toml"),
+            r#"
+[artifact]
+id      = "io.kiki.test.agent"
+name    = "test-agent"
+version = "1.0.0"
+kind    = "agent"
+license = "MIT"
+
+[capabilities]
+
+[exec]
+command = "agent-bin"
+"#,
+        )
+        .unwrap();
+    }
+
+    /// An `agent` (untrusted) artifact must NOT load as a host process when
+    /// Firecracker isn't configured — it fails closed instead of escaping the
+    /// microVM isolation its kind demands.
+    #[tokio::test]
+    async fn agent_artifact_fails_closed_without_firecracker() {
+        let tmp = std::env::temp_dir().join(format!("kiki-loader-fc-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_agent_manifest(&tmp);
+
+        let hub = Arc::new(McpHub::new());
+        // Trusted=true so capability validation can't be the thing that fails —
+        // we're asserting the isolation routing fails closed.
+        let loader = PluginLoader::new(hub, CapabilitySet::default(), "/run/kiki/mcp.sock");
+        let res = loader.load_artifact(tmp.join("kiki.toml"), true).await;
+
+        assert!(res.is_err(), "agent artifact must not load without Firecracker");
+        let msg = format!("{:?}", res.unwrap_err());
+        assert!(msg.contains("Firecracker"), "error should name Firecracker: {msg}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// With Firecracker configured but the artifact shipping no rootfs image, the
+    /// loader still fails closed (won't boot a VM with no guest fs).
+    #[tokio::test]
+    async fn agent_artifact_fails_closed_without_rootfs() {
+        let tmp = std::env::temp_dir().join(format!("kiki-loader-fc2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_agent_manifest(&tmp);
+
+        let hub = Arc::new(McpHub::new());
+        let loader = PluginLoader::new(hub, CapabilitySet::default(), "/run/kiki/mcp.sock")
+            .with_firecracker(FirecrackerConfig {
+                firecracker_bin: "/usr/bin/firecracker".into(),
+                kernel_image:    "/var/kiki/vm/vmlinux".into(),
+            });
+        let res = loader.load_artifact(tmp.join("kiki.toml"), true).await;
+
+        assert!(res.is_err(), "agent artifact must not load without a rootfs");
+        let msg = format!("{:?}", res.unwrap_err());
+        assert!(msg.contains("rootfs"), "error should name the missing rootfs: {msg}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
