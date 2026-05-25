@@ -276,28 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn lock_timeout_secs_default_is_zero() {
-        // Set to explicit "0" to avoid a race with lock_timeout_secs_reads_env
-        // setting KIKI_LOCK_TIMEOUT_SECS to "300" in a parallel test thread.
-        std::env::set_var("KIKI_LOCK_TIMEOUT_SECS", "0");
-        assert_eq!(lock_timeout_secs(), 0);
+    fn lock_timeout_secs_env_behavior() {
+        // Run both assertions in one test so the env-var writes are atomic from
+        // the perspective of the parallel test runner (no cross-test race).
         std::env::remove_var("KIKI_LOCK_TIMEOUT_SECS");
-    }
-
-    #[test]
-    fn lock_timeout_secs_reads_env() {
-        // Use a temporarily-set value and a parse sanity-check.
-        // This test validates the env var parsing path; the zero / unset case
-        // is handled by lock_timeout_secs_default_is_zero above.
-        let prev = std::env::var("KIKI_LOCK_TIMEOUT_SECS").ok();
+        assert_eq!(lock_timeout_secs(), 0, "unset → default 0");
         std::env::set_var("KIKI_LOCK_TIMEOUT_SECS", "300");
-        let got = lock_timeout_secs();
-        // Restore before asserting so clean-up happens even on failure.
-        match prev {
-            Some(v) => std::env::set_var("KIKI_LOCK_TIMEOUT_SECS", v),
-            None    => std::env::remove_var("KIKI_LOCK_TIMEOUT_SECS"),
-        }
-        assert_eq!(got, 300);
+        assert_eq!(lock_timeout_secs(), 300, "set → reads the value");
+        std::env::remove_var("KIKI_LOCK_TIMEOUT_SECS");
     }
 
     #[tokio::test]

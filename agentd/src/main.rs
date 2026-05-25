@@ -637,6 +637,9 @@ async fn main() -> anyhow::Result<()> {
     let session_id = session.id.clone();
     let agent_id   = session.agent_id.clone();
 
+    // Cloud metadata sync: fire-and-forget notify registry that session is active.
+    cloud_sync_session(&session_id, &node_id, &session.label, "active");
+
     // Wire the lock timeout task for the foreground session.
     {
         let timeout_secs = lock::lock_timeout_secs();
@@ -820,6 +823,7 @@ async fn main() -> anyhow::Result<()> {
                             session.confirm_freeze();
                             // T50: update sessions index — session is now parked.
                             upsert_session_index(&session_id, &session.label, "parked");
+                            cloud_sync_session(&session_id, &node_id, &session.label, "parked");
                         }
                         Err(e) => {
                             error!(session = %session_id, error = %e, "park snapshot failed");
@@ -831,6 +835,7 @@ async fn main() -> anyhow::Result<()> {
                     let messages = harness.ctx.messages.clone();
                     info!(session = %session_id, ?outcome, "session complete");
                     session.complete();
+                    cloud_sync_session(&session_id, &node_id, &session.label, "completed");
                     // T50: remove from sessions index when complete.
                     remove_session_index(&session_id);
                     dreamer.spawn(session_id.clone(), agent_id, messages, state);
@@ -838,6 +843,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     error!(session = %session_id, error = %e, "session failed");
                     session.fail(e.to_string());
+                    cloud_sync_session(&session_id, &node_id, &session.label, "failed");
                     remove_session_index(&session_id);
                 }
             }
@@ -1917,6 +1923,43 @@ fn approval_from_resolution(v: &serde_json::Value) -> kiki_core::types::Approval
     }
 }
 
+/// Fire-and-forget POST/PATCH to the registry's session metadata API.
+/// Best-effort: errors are logged but never block local lifecycle.
+/// Reads KIKI_REGISTRY_URL + KIKI_TOKEN from env.
+fn cloud_sync_session(session_id: &str, node_id: &str, label: &str, phase: &str) {
+    let token = std::env::var("KIKI_TOKEN").ok().filter(|t| !t.is_empty());
+    let Some(token) = token else { return }; // skip if no cloud token
+    let registry_url = std::env::var("KIKI_REGISTRY_URL")
+        .unwrap_or_else(|_| "https://registry.kiki-os.com".into());
+    let session_id = session_id.to_string();
+    let node_id    = node_id.to_string();
+    let label      = label.to_string();
+    let phase      = phase.to_string();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "session_id": session_id,
+            "node_id":    node_id,
+            "label":      label,
+            "phase":      phase,
+        });
+        // POST upserts the session (creates or updates).
+        let result = client
+            .post(format!("{registry_url}/v1/sessions"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await;
+        match result {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(session = %session_id, phase = %phase, "cloud session sync ok");
+            }
+            Ok(r) => tracing::warn!(session = %session_id, status = %r.status(), "cloud session sync non-2xx"),
+            Err(e) => tracing::warn!(session = %session_id, error = %e, "cloud session sync failed"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2178,5 +2221,14 @@ mod tests {
         assert!(local_snapshot_exists("my-session", dir.to_str().unwrap()));
         assert!(!local_snapshot_exists("other-session", dir.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// cloud_sync_session is a no-op when KIKI_TOKEN is absent — no panic, no
+    /// background task spawned (the function returns immediately).
+    #[test]
+    fn cloud_sync_skipped_without_token() {
+        std::env::remove_var("KIKI_TOKEN");
+        cloud_sync_session("s1", "node-1", "test session", "active");
+        // No panic, no background task (returns immediately when no token).
     }
 }
