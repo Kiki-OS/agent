@@ -530,7 +530,7 @@ mod tests {
             messages: vec![], interrupt_queue: vec![],
             control_mode: kiki_core::context::ControlMode::AgentMode,
             session_label: "t".into(), scenario: None,
-            layout: Default::default(), active_apps: vec![], app_states: Default::default(),
+            layout: Default::default(), active_apps: vec![],
         };
         let bundle = be.snapshot(runtime).await.unwrap();
         let hash = bundle.checkpoint.ref_hash.unwrap();
