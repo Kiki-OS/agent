@@ -573,6 +573,20 @@ impl Harness {
             // the command channel and caches it for `screen.inventory`. Handled
             // defensively here so the harness never chokes if one slips through.
             ControlMessage::SurfaceInventory { .. } => Ok(LoopControl::Continue),
+            // Session resume/create are agentd-level orchestration (spawn another
+            // harness) — never a command for THIS harness.
+            ControlMessage::ResumeSession { .. }
+            | ControlMessage::CreateSession { .. } => Ok(LoopControl::Continue),
+
+            // OOBE input is consumed by the OOBE state machine in agentd (before
+            // control messages reach the harness). Handled defensively so the
+            // harness never panics if one slips through.
+            ControlMessage::OobeInput { .. } => Ok(LoopControl::Continue),
+
+            // Lock / Unlock are orchestrated by agentd (park + hold or resume).
+            // The harness itself is not locked — agentd freezes it externally.
+            ControlMessage::LockSession { .. }
+            | ControlMessage::UnlockSession { .. } => Ok(LoopControl::Continue),
         }
     }
 

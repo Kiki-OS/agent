@@ -1347,6 +1347,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "kiki-core",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

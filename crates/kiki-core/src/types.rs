@@ -165,6 +165,47 @@ pub enum ControlMessage {
     /// latest inventory and exposes it via the built-in `screen.inventory` tool so
     /// the agent perceives the screen as DATA (not by scraping a pixel a11y tree).
     SurfaceInventory { surfaces: Vec<SurfaceInfo> },
+
+    /// Resume a previously-parked session by id into the running daemon. agentd
+    /// reconstructs it from its local snapshot bundle (NOT a command for the
+    /// current harness — agentd intercepts it before the command channel).
+    ResumeSession { session_id: String },
+
+    /// Create a brand-new desktop session in the running daemon, with its own
+    /// isolated app instances. The DE owns the `session_id` (its desktop join
+    /// key). agentd intercepts this before the command channel.
+    CreateSession { session_id: String, label: Option<String> },
+
+    /// OOBE step input from the shell: the user submitted a value for `step`.
+    /// agentd intercepts this before the command channel; the OOBE state
+    /// machine drives the conversation until it emits `OobeComplete`.
+    OobeInput { step: String, value: serde_json::Value },
+
+    /// Park the named session and hold it in a "locked" suspended state
+    /// (distinct from a simple park — the session is suspended in memory
+    /// awaiting an unlock rather than discarded to disk).
+    LockSession { session_id: String },
+
+    /// Unlock a previously locked session, resuming it. `pin` is validated
+    /// when present; for now any pin (or `None`) is accepted — real hardware
+    /// auth is a future extension.
+    UnlockSession { session_id: String, pin: Option<String> },
+}
+
+// ─── OOBE ────────────────────────────────────────────────────────────────────
+
+/// Coarse phases of the out-of-box experience flow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OobeStepKind {
+    /// Show the welcome screen and prompt for a device name.
+    Welcome,
+    /// Link the device to a cloud account (device flow).
+    AccountSetup,
+    /// Trigger `kpkg install` of the default model (fire-and-forget download).
+    ModelDownload,
+    /// OOBE complete — initial desktop session has been created.
+    Done,
 }
 
 /// One on-screen surface as the compositor sees it. Byte-compatible with
@@ -238,5 +279,66 @@ mod tests {
             }
             other => panic!("expected SurfaceInventory, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_session_wire_matches_de() {
+        let m = ControlMessage::ResumeSession { session_id: "s1".into() };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({ "type": "resume_session", "session_id": "s1" })
+        );
+        // Round-trips from the DE's form.
+        let parsed: ControlMessage =
+            serde_json::from_str(r#"{"type":"resume_session","session_id":"x"}"#).unwrap();
+        assert!(matches!(parsed, ControlMessage::ResumeSession { session_id } if session_id == "x"));
+    }
+
+    #[test]
+    fn create_session_wire_matches_de() {
+        let m = ControlMessage::CreateSession { session_id: "d2".into(), label: Some("Work".into()) };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({ "type": "create_session", "session_id": "d2", "label": "Work" })
+        );
+        // label is optional (null/omitted) and round-trips from the DE's form.
+        let parsed: ControlMessage =
+            serde_json::from_str(r#"{"type":"create_session","session_id":"d3","label":null}"#).unwrap();
+        assert!(matches!(parsed, ControlMessage::CreateSession { session_id, label }
+            if session_id == "d3" && label.is_none()));
+    }
+
+    #[test]
+    fn oobe_and_lock_wire_matches_de() {
+        // OobeInput
+        let m = ControlMessage::OobeInput {
+            step:  "welcome".into(),
+            value: serde_json::json!({ "device_name": "kiki-home" }),
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["type"], "oobe_input");
+        assert_eq!(v["step"], "welcome");
+        assert_eq!(v["value"]["device_name"], "kiki-home");
+        let back: ControlMessage = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, ControlMessage::OobeInput { ref step, .. } if step == "welcome"));
+
+        // LockSession
+        let m = ControlMessage::LockSession { session_id: "s1".into() };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            serde_json::json!({ "type": "lock_session", "session_id": "s1" })
+        );
+
+        // UnlockSession with pin
+        let m = ControlMessage::UnlockSession { session_id: "s1".into(), pin: Some("1234".into()) };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["type"], "unlock_session");
+        assert_eq!(v["pin"], "1234");
+
+        // UnlockSession without pin
+        let m = ControlMessage::UnlockSession { session_id: "s2".into(), pin: None };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["type"], "unlock_session");
+        assert_eq!(v["pin"], serde_json::Value::Null);
     }
 }

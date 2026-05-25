@@ -12,12 +12,13 @@
 //! for untrusted LLM-generated code. Firecracker for anything that executes
 //! model output.
 
-pub mod broker;      // capability broker: checks CapabilitySet before every action
-pub mod namespace;   // Linux namespaces + seccomp profiles
-pub mod landlock;    // Landlock filesystem allowlist (policy + Linux enforcement)
-pub mod seccomp;     // seccomp-bpf syscall denylist (policy + Linux enforcement)
-pub mod firecracker; // Firecracker MicroVM backend for untrusted code
-pub mod wayland;     // Wayland protocol filter (per-surface isolation)
+pub mod broker;          // capability broker: checks CapabilitySet before every action
+pub mod namespace;       // Linux namespaces + seccomp profiles
+pub mod landlock;        // Landlock filesystem allowlist (policy + Linux enforcement)
+pub mod seccomp;         // seccomp-bpf syscall denylist (policy + Linux enforcement)
+pub mod firecracker;     // Firecracker MicroVM backend for untrusted code
+pub mod wayland;         // Wayland protocol filter (per-surface isolation)
+pub mod wayland_filter;  // allowlist-based wl_registry.global filter + WaylandGlobal type
 
 pub use firecracker::{kvm_available, FirecrackerError, MicroVm, MicroVmConfig};
 pub use landlock::{FsAccess, LandlockRule, RuntimePaths};
